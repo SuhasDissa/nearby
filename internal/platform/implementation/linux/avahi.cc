@@ -34,6 +34,11 @@ void Server::onResolveServiceReply(const int32_t& interface,
     return;
   }
 
+  if (IsOwnServiceName(name)) {
+    LOG(INFO) << __func__ << ": Ignoring resolve result for own service.";
+    return;
+  }
+
   LOG(INFO) << "Resolved reply received";
   NsdServiceInfo info;
 
@@ -64,7 +69,8 @@ void ServiceBrowser::onItemNew(const int32_t &interface,
                        << protocol << ", name: '" << name << "', type: '"
                        << type << "', domain: '" << domain
                        << "', flags: " << flags;
-  if (flags & kAvahiLookupResultLocal) {
+  if ((flags & (kAvahiLookupResultLocal | kAvahiLookupResultOurOwn)) ||
+      server_->IsOwnServiceName(name)) {
     LOG(INFO) << __func__ << ": Ignoring local service.";
     return;
   }

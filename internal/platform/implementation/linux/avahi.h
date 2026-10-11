@@ -16,6 +16,10 @@
 #define PLATFORM_IMPL_LINUX_AVAHI_H_
 
 #include <memory>
+#include <string>
+
+#include "absl/container/flat_hash_set.h"
+#include "absl/synchronization/mutex.h"
 
 #include <sdbus-c++/IConnection.h>
 #include <sdbus-c++/ProxyInterfaces.h>
@@ -57,6 +61,14 @@ class Server final
       api::WifiLanMedium::DiscoveredServiceCallback callback) {
     discovery_cb_ = std::move(callback);
   }
+  void AddOwnServiceName(const std::string &name) {
+    absl::MutexLock l(&own_names_mutex_);
+    own_service_names_.insert(name);
+  }
+  bool IsOwnServiceName(const std::string &name) {
+    absl::MutexLock l(&own_names_mutex_);
+    return own_service_names_.count(name) != 0;
+  }
   api::WifiLanMedium::DiscoveredServiceCallback discovery_cb_;
  protected:
   void onStateChanged(const int32_t &state, const std::string &error) override {
@@ -68,6 +80,11 @@ class Server final
     const std::string& address, const uint16_t& port,
     const std::vector<std::vector<uint8_t>>& txt, const uint32_t& flags,
     std::optional<sdbus::Error> error) override;
+
+ private:
+  absl::Mutex own_names_mutex_;
+  absl::flat_hash_set<std::string> own_service_names_
+      ABSL_GUARDED_BY(own_names_mutex_);
 };
 
 class EntryGroup final

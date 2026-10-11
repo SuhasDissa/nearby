@@ -47,11 +47,14 @@ class BleL2capServerSocket final : public api::ble::BleL2capServerSocket {
 
  private:
 
+  bool CreateListeningSocket() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
   absl::Mutex mutex_;
   bool closed_ ABSL_GUARDED_BY(mutex_) = false;
   int psm_ = 0;
   std::string service_id_ ABSL_GUARDED_BY(mutex_);
   int server_fd_ ABSL_GUARDED_BY(mutex_) = -1;
+  bool accepting_ ABSL_GUARDED_BY(mutex_) = false;
 };
 
 }  // namespace linux

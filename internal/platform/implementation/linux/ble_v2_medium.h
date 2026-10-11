@@ -120,9 +120,14 @@ class BleV2Medium final : public api::ble::BleMedium {
   //                          GetRemotePeripheralCallback callback) override;
 
  private:
+  struct ServiceDataDiscovery;
+
   bool StartLEDiscovery();
   bool WaitForAdvertisementMonitorManager();
   void OnRegisterMonitorReply(std::optional<sdbus::Error> error);
+  bool StartFallbackScan(const Uuid& service_uuid,
+                         api::ble::BleMedium::ScanningCallback callback);
+  void StopFallbackScan(const Uuid& service_uuid);
 
   bool MonitorManagerSupportsOr() {
     std::vector<std::string> supported_types;
@@ -142,6 +147,8 @@ class BleV2Medium final : public api::ble::BleMedium {
     return std::find_if(supported_types.cbegin(), end, is_supported_type) !=
            end;
   }
+
+  std::shared_ptr<ServiceDataDiscovery> service_data_discovery_;
 
   std::shared_ptr<sdbus::IConnection> system_bus_;
   BluetoothAdapter adapter_;
@@ -175,6 +182,10 @@ class BleV2Medium final : public api::ble::BleMedium {
       ABSL_GUARDED_BY(cur_adv_mutex_);
 
   absl::Mutex advs_mutex_;
+  bool extended_adv_registered_ ABSL_GUARDED_BY(advs_mutex_) = false;
+  bool adv_capabilities_read_ ABSL_GUARDED_BY(advs_mutex_) = false;
+  std::optional<int16_t> adv_min_tx_power_ ABSL_GUARDED_BY(advs_mutex_);
+  std::optional<int16_t> adv_max_tx_power_ ABSL_GUARDED_BY(advs_mutex_);
   std::list<std::unique_ptr<bluez::LEAdvertisement>> advs_
       ABSL_GUARDED_BY(advs_mutex_);
 };

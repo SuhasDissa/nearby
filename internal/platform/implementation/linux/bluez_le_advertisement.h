@@ -16,6 +16,8 @@
 #define PLATFORM_IMPL_LINUX_API_BLUEZ_BLE_ADVERTISEMENT_H_
 
 #include <future>
+#include <optional>
+#include <string>
 #include <sdbus-c++/AdaptorInterfaces.h>
 #include <sdbus-c++/IConnection.h>
 #include <sdbus-c++/ProxyInterfaces.h>
@@ -43,16 +45,21 @@ class LEAdvertisement final
 
   LEAdvertisement(sdbus::IConnection& system_bus, sdbus::ObjectPath path,
                   const api::ble::BleAdvertisementData& advertising_data,
-                  api::ble::AdvertiseParameters advertise_set_parameters);
+                  api::ble::AdvertiseParameters advertise_set_parameters,
+                  std::string type = "peripheral",
+                  std::optional<int16_t> tx_power_override = std::nullopt);
 
   static std::unique_ptr<LEAdvertisement> CreateLEAdvertisement(
       sdbus::IConnection& system_bus,
       const api::ble::BleAdvertisementData& advertising_data,
-      api::ble::AdvertiseParameters advertising_parameters) {
+      api::ble::AdvertiseParameters advertising_parameters,
+      std::string type = "peripheral",
+      std::optional<int16_t> tx_power_override = std::nullopt) {
     static std::atomic<size_t> adv_count = 0;
     auto object_path = bluez::ble_advertisement_path(adv_count++);
     return std::make_unique<LEAdvertisement>(
-        system_bus, object_path, advertising_data, advertising_parameters);
+        system_bus, object_path, advertising_data, advertising_parameters,
+        std::move(type), tx_power_override);
   }
   ~LEAdvertisement() { 
     LOG(INFO) << __func__ << "Unregistering advertisement adaptor";
@@ -67,7 +74,7 @@ class LEAdvertisement final
   }
 
   // Properties  
-  std::string Type() override { return "peripheral"; }
+  std::string Type() override { return type_; }
   std::vector<std::string> ServiceUUIDs() override { return service_uuids_; }
   std::map<std::string, sdbus::Variant> ManufacturerData() override {
     return {};
@@ -90,6 +97,9 @@ class LEAdvertisement final
   uint32_t MinInterval() override { return 118; }
   uint32_t MaxInterval() override { return 119; }
   int16_t TxPower() override {
+    if (tx_power_override_.has_value()) {
+      return *tx_power_override_;
+    }
     return bluez::TxPowerLevelDbm(advertise_set_parameters_.tx_power_level);
   };
 
@@ -97,6 +107,8 @@ class LEAdvertisement final
   std::vector<std::string> service_uuids_;
   std::map<std::string, sdbus::Variant> service_data_;
   api::ble::AdvertiseParameters advertise_set_parameters_;
+  std::string type_;
+  std::optional<int16_t> tx_power_override_;
 };
 
 class LEAdvertisementManager final

@@ -94,11 +94,7 @@ std::string BluetoothAdapter::GetName() const {
   }
 }
 
-bool BluetoothAdapter::SetName(absl::string_view name, bool  /*persist*/) {
-  return SetName(name);
-}
-
-bool BluetoothAdapter::SetName(absl::string_view name) {
+bool BluetoothAdapter::SetName(absl::string_view name, bool /*persist*/) {
   try {
     bluez_adapter_->Alias(std::string(name));
     return true;

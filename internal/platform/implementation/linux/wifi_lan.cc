@@ -147,6 +147,8 @@ bool WifiLanMedium::StartAdvertising(const NsdServiceInfo& nsd_service_info) {
   LOG(INFO) << __func__ << ": Adding avahi service with service type: "
             << nsd_service_info.GetServiceType();
 
+  avahi_->AddOwnServiceName(nsd_service_info.GetServiceName());
+
   try {
     entry_group->AddService(
         -1,  // AVAHI_IF_UNSPEC

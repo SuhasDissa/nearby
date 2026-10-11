@@ -14,6 +14,7 @@
 
 #ifndef PLATFORM_IMPL_LINUX_WIFI_LAN_H_
 #define PLATFORM_IMPL_LINUX_WIFI_LAN_H_
+#include <arpa/inet.h>
 #include <sdbus-c++/IConnection.h>
 #include <memory>
 
@@ -52,8 +53,14 @@ class WifiLanMedium : public api::WifiLanMedium {
     std::unique_ptr<api::WifiLanSocket> ConnectToService(
         const ServiceAddress &sa,
         CancellationFlag *cancellation_flag) override {
-        return ConnectToService(std::string(sa.address.begin(), sa.address.end()),
-                                sa.port, cancellation_flag);
+        // ServiceAddress holds raw address bytes; TCPSocket wants dotted text.
+        char text[INET_ADDRSTRLEN];
+        if (sa.address.size() != 4 ||
+            inet_ntop(AF_INET, sa.address.data(), text, sizeof(text)) ==
+                nullptr) {
+          return nullptr;
+        }
+        return ConnectToService(text, sa.port, cancellation_flag);
     };
     std::unique_ptr<api::WifiLanSocket> ConnectToService(
       const std::string &ip_address, int port,

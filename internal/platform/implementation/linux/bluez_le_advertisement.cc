@@ -34,16 +34,19 @@ namespace bluez {
 LEAdvertisement::LEAdvertisement(
     sdbus::IConnection& system_bus, sdbus::ObjectPath path,
     const api::ble::BleAdvertisementData& advertising_data,
-    api::ble::AdvertiseParameters advertise_set_parameters)
+    api::ble::AdvertiseParameters advertise_set_parameters, std::string type,
+    std::optional<int16_t> tx_power_override)
     : AdaptorInterfaces(system_bus, std::move(path)),
       is_extended_advertisement_(advertising_data.is_extended_advertisement),
-      advertise_set_parameters_(advertise_set_parameters) {
+      advertise_set_parameters_(advertise_set_parameters),
+      type_(std::move(type)),
+      tx_power_override_(tx_power_override) {
   for (const auto& [uuid, data] : advertising_data.service_data) {
     std::string uuid_string(uuid);
     std::vector<uint8_t> data_bytes(data.size());
     const auto* bytes = data.data();
 
-    if (is_extended_advertisement_){
+    if (is_extended_advertisement_) {
       service_uuids_.push_back(uuid_string);
     }
     // service_uuids_.push_back("0000FE2C-0000-1000-8000-00805F9B34FB");
@@ -54,7 +57,20 @@ LEAdvertisement::LEAdvertisement(
     LOG(INFO)<< __func__ << ": " << uuid_string;
     LOG(INFO)<< __func__ << ": " << BytesToHexString(data_bytes);
     service_data_.insert({uuid_string, std::move(sdbus::Variant(data_bytes))});
-    // service_data_.insert({"0000FE2C-0000-1000-8000-00805F9B34FB", std::move(data_bytes)});
+  }
+
+  // This controller accepts a single LE advertisement. The phone's share
+  // sheet looks for the fast-init UUID 0xFE2C, while the Quick Share payload
+  // is on 0xFEF3. Put the notify beacon in the same extended packet.
+  if (is_extended_advertisement_ &&
+      service_data_.count("0000FE2C-0000-1000-8000-00805F9B34FB") == 0 &&
+      service_data_.count("0000fe2c-0000-1000-8000-00805f9b34fb") == 0) {
+    const std::vector<uint8_t> fast_init = {
+        0xfc, 0x12, 0x8e, 0x00, 0x2d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80};
+    service_data_.insert(
+        {"0000FE2C-0000-1000-8000-00805F9B34FB", sdbus::Variant(fast_init)});
+    service_uuids_.push_back("0000FE2C-0000-1000-8000-00805F9B34FB");
   }
 
   registerAdaptor();

@@ -73,7 +73,7 @@ class LinuxFastInitiationManager final
 
   bool IsAdvertising() override {
     absl::MutexLock lock(&mutex_);
-    return advertisement_ != nullptr;
+    return advertisement_ != nullptr || using_primary_advertisement_;
   }
   bool IsScanning() override;
 
@@ -103,6 +103,10 @@ class LinuxFastInitiationManager final
   absl::Mutex mutex_;
   std::unique_ptr<::nearby::linux::bluez::LEAdvertisement> advertisement_
       ABSL_GUARDED_BY(mutex_);
+  // The extended Quick Share advertisement already carries the 0xFE2C beacon.
+  // This adapter only accepts one LE advertisement, so a second registration
+  // fails. Treat that as success instead of a hardware fault.
+  bool using_primary_advertisement_ ABSL_GUARDED_BY(mutex_) = false;
 
   bool is_scanning_ ABSL_GUARDED_BY(mutex_) = false;
   bool owns_bluez_discovery_ ABSL_GUARDED_BY(mutex_) = false;

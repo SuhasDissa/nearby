@@ -65,9 +65,9 @@ void LinuxFastInitiationManager::StartAdvertising(
     std::function<void(nearby::api::FastInitiationManager::Error)>
         error_callback) {
   absl::MutexLock lock(&mutex_);
-  if (advertisement_ != nullptr) {
-    if (error_callback) {
-      error_callback(nearby::api::FastInitiationManager::Error::kResourceInUse);
+  if (advertisement_ != nullptr || using_primary_advertisement_) {
+    if (callback) {
+      callback();
     }
     return;
   }
@@ -132,11 +132,20 @@ void LinuxFastInitiationManager::StartAdvertising(
         advertisement_->getObject().getObjectPath(), {});
   } catch (const sdbus::Error& e) {
     advertisement_.reset();
+    // org.bluez.Error.Failed / AlreadyExists means the controller already has
+    // the Quick Share advertisement, which includes this beacon.
+    if (e.getName() == "org.bluez.Error.Failed" ||
+        e.getName() == "org.bluez.Error.AlreadyExists") {
+      using_primary_advertisement_ = true;
+      LOG(INFO) << "Fast-init beacon is already in the Quick Share "
+                   "advertisement; not registering a second one";
+      if (callback) {
+        callback();
+      }
+      return;
+    }
     if (error_callback) {
-      if (e.getName() == "org.bluez.Error.AlreadyExists") {
-        error_callback(
-            nearby::api::FastInitiationManager::Error::kResourceInUse);
-      } else if (e.getName() == "org.bluez.Error.NotPermitted") {
+      if (e.getName() == "org.bluez.Error.NotPermitted") {
         error_callback(
             nearby::api::FastInitiationManager::Error::kDisabledByUser);
       } else {
@@ -154,6 +163,13 @@ void LinuxFastInitiationManager::StartAdvertising(
 void LinuxFastInitiationManager::StopAdvertising(
     std::function<void()> callback) {
   absl::MutexLock lock(&mutex_);
+  if (using_primary_advertisement_) {
+    using_primary_advertisement_ = false;
+    if (callback) {
+      callback();
+    }
+    return;
+  }
   if (advertisement_ != nullptr && adv_manager_ != nullptr) {
     try {
       adv_manager_->UnregisterAdvertisementSync(

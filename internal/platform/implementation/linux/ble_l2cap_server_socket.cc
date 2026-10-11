@@ -48,67 +48,114 @@ void BleL2capServerSocket::SetPSM(int psm) {
   psm_ = psm;
 }
 
-std::unique_ptr<api::ble::BleL2capSocket> BleL2capServerSocket::Accept() {
-  {
-    server_fd_ = socket(AF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP);
-    if (server_fd_ < 0) {
-      LOG(ERROR) << "Failed to create L2CAP server socket: "
-                 << std::strerror(errno);
-      return nullptr;
-    }
-
-    // generating psm value for l2cap socket
-    Prng prng;
-    psm_ = 0x80 + (prng.NextUint32() % 0x80);
-
-    sockaddr_l2 addr;
-    std::memset(&addr, 0, sizeof(addr));
-    addr.l2_family = AF_BLUETOOTH;
-    addr.l2_psm = htobs(psm_);
-    addr.l2_bdaddr_type = BDADDR_LE_PUBLIC;
-    std::memset(&addr.l2_bdaddr, 0, sizeof(addr.l2_bdaddr));
-
-    if (bind(server_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) <
-        0) {
-      LOG(ERROR) << "Failed to bind L2CAP server socket: "
-                 << std::strerror(errno) << " (errno: " << errno << ")";
-      close(server_fd_);
-      server_fd_ = -1;
-      return nullptr;
-    }
-
-    constexpr uint16_t kReceiveMtu = 672;
-    if (setsockopt(server_fd_, SOL_BLUETOOTH, BT_RCVMTU, &kReceiveMtu,
-                   sizeof(kReceiveMtu)) < 0) {
-      LOG(WARNING) << "Failed to set receive MTU on L2CAP server socket: "
-                   << std::strerror(errno);
-    }
-
-    if (listen(server_fd_, 5) < 0) {
-      LOG(ERROR) << "Failed to listen on L2CAP server socket: "
-                 << std::strerror(errno);
-      close(server_fd_);
-      server_fd_ = -1;
-      return nullptr;
-    }
-
-    socklen_t addr_len = sizeof(addr);
-    if (getsockname(server_fd_, reinterpret_cast<sockaddr*>(&addr),
-                    &addr_len) == 0) {
-      psm_ = btohs(addr.l2_psm);
-      LOG(INFO) << "L2CAP server socket listening on PSM: " << psm_;
-    } else {
-      LOG(WARNING) << "Failed to get socket name: " << std::strerror(errno);
-    }
+bool BleL2capServerSocket::CreateListeningSocket() {
+  server_fd_ = socket(AF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP);
+  if (server_fd_ < 0) {
+    LOG(ERROR) << "Failed to create L2CAP server socket: "
+               << std::strerror(errno);
+    return false;
   }
 
-  sockaddr_l2 client_addr;
-  std::memset(&client_addr, 0, sizeof(client_addr));
-  socklen_t client_len = sizeof(client_addr);
+  Prng prng;
+  psm_ = 0x80 + (prng.NextUint32() % 0x80);
+
+  sockaddr_l2 addr;
+  std::memset(&addr, 0, sizeof(addr));
+  addr.l2_family = AF_BLUETOOTH;
+  addr.l2_psm = htobs(psm_);
+  addr.l2_bdaddr_type = BDADDR_LE_PUBLIC;
+  std::memset(&addr.l2_bdaddr, 0, sizeof(addr.l2_bdaddr));
+
+  if (bind(server_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+    LOG(ERROR) << "Failed to bind L2CAP server socket: " << std::strerror(errno)
+               << " (errno: " << errno << ")";
+    close(server_fd_);
+    server_fd_ = -1;
+    return false;
+  }
+
+  constexpr uint16_t kReceiveMtu = 672;
+  if (setsockopt(server_fd_, SOL_BLUETOOTH, BT_RCVMTU, &kReceiveMtu,
+                 sizeof(kReceiveMtu)) < 0) {
+    LOG(WARNING) << "Failed to set receive MTU on L2CAP server socket: "
+                 << std::strerror(errno);
+  }
+
+  if (listen(server_fd_, 5) < 0) {
+    LOG(ERROR) << "Failed to listen on L2CAP server socket: "
+               << std::strerror(errno);
+    close(server_fd_);
+    server_fd_ = -1;
+    return false;
+  }
+
+  socklen_t addr_len = sizeof(addr);
+  if (getsockname(server_fd_, reinterpret_cast<sockaddr*>(&addr), &addr_len) ==
+      0) {
+    psm_ = btohs(addr.l2_psm);
+    LOG(INFO) << "L2CAP server socket listening on PSM: " << psm_;
+  } else {
+    LOG(WARNING) << "Failed to get socket name: " << std::strerror(errno);
+  }
+  return true;
+}
+
+std::unique_ptr<api::ble::BleL2capSocket> BleL2capServerSocket::Accept() {
+  int server_fd;
+  {
+    absl::MutexLock lock(&mutex_);
+    if (closed_) {
+      return nullptr;
+    }
+    if (server_fd_ < 0 && !CreateListeningSocket()) {
+      return nullptr;
+    }
+    server_fd = server_fd_;
+    accepting_ = true;
+  }
 
   LOG(INFO) << "Waiting for L2CAP connection on PSM " << psm_ << "...";
 
-  int client_fd = accept(server_fd_, (struct sockaddr*) &client_addr, &client_len);
+  int client_fd = -1;
+  sockaddr_l2 client_addr;
+  std::memset(&client_addr, 0, sizeof(client_addr));
+  while (true) {
+    {
+      absl::MutexLock lock(&mutex_);
+      if (closed_) {
+        accepting_ = false;
+        close(std::exchange(server_fd_, -1));
+        return nullptr;
+      }
+    }
+    pollfd pfd = {server_fd, POLLIN, 0};
+    int ret = poll(&pfd, 1, 200);
+    if (ret < 0 && errno != EINTR) {
+      LOG(ERROR) << "Failed to poll L2CAP server socket: "
+                 << std::strerror(errno);
+      absl::MutexLock lock(&mutex_);
+      accepting_ = false;
+      return nullptr;
+    }
+    if (ret > 0) {
+      socklen_t client_len = sizeof(client_addr);
+      client_fd = accept(server_fd, reinterpret_cast<sockaddr*>(&client_addr),
+                         &client_len);
+      break;
+    }
+  }
+
+  {
+    absl::MutexLock lock(&mutex_);
+    accepting_ = false;
+    if (closed_) {
+      if (client_fd >= 0) {
+        close(client_fd);
+      }
+      close(std::exchange(server_fd_, -1));
+      return nullptr;
+    }
+  }
 
   if (client_fd < 0) {
     if (errno == EINTR || errno == EAGAIN) {
@@ -146,7 +193,9 @@ Exception BleL2capServerSocket::Close() {
       return {Exception::kSuccess};
     }
     closed_ = true;
-    server_fd = std::exchange(server_fd_, -1);
+    if (!accepting_) {
+      server_fd = std::exchange(server_fd_, -1);
+    }
   }
   if (server_fd != -1 && close(server_fd) != 0) {
     LOG(WARNING) << "Failed to close L2CAP server socket: "

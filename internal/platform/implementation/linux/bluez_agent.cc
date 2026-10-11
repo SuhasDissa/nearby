@@ -1,5 +1,7 @@
 #include "internal/platform/implementation/linux/bluez_agent.h"
 
+#include <atomic>
+
 #include <sdbus-c++/AdaptorInterfaces.h>
 
 #include "internal/platform/implementation/linux/generated/dbus/bluez/agent_server.h"
@@ -10,9 +12,21 @@
 namespace nearby {
 namespace linux {
 
+std::atomic<int> g_pairing_prompts{0};
+
+namespace {
+void NotePairingPrompt(const char* method) {
+  g_pairing_prompts.fetch_add(1);
+  LOG(WARNING) << "[agent] BlueZ requested pairing via " << method
+               << ". The L2CAP profile is unauthenticated; this prompt is a "
+                  "known Linux Bluetooth limitation.";
+}
+}  // namespace
+
 void Agent::Release() { LOG(INFO) << "[agent] Release()"; }
 
 std::string Agent::RequestPinCode(const sdbus::ObjectPath& device) {
+  NotePairingPrompt("RequestPinCode");
   LOG(INFO) << "[agent] RequestPinCode(" << device << ")";
   return "0000";
 }
@@ -23,6 +37,7 @@ void Agent::DisplayPinCode(const sdbus::ObjectPath& device,
 }
 
 uint32_t Agent::RequestPasskey(const sdbus::ObjectPath& device) {
+  NotePairingPrompt("RequestPasskey");
   LOG(INFO) << "[agent] RequestPasskey(" << device << ")";
   return 123456;
 }
@@ -36,6 +51,7 @@ void Agent::DisplayPasskey(const sdbus::ObjectPath& device,
 
 void Agent::RequestConfirmation(const sdbus::ObjectPath& device,
                                 const uint32_t& passkey) {
+  NotePairingPrompt("RequestConfirmation");
   LOG(INFO) << "[agent] RequestConfirmation(" << device << ", " << passkey
             << ") -> ACCEPT";
 }
@@ -97,3 +113,7 @@ bool AgentManager::Register(std::optional<absl::string_view> capability,
 
 }  // namespace linux
 }  // namespace nearby
+
+extern "C" int nearby_linux_pairing_prompt_count() {
+  return nearby::linux::g_pairing_prompts.load();
+}

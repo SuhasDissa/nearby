@@ -19,6 +19,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <string>
 
 #include <sdbus-c++/IConnection.h>
 #include <sdbus-c++/IProxy.h>
@@ -26,6 +27,7 @@
 #include <sdbus-c++/StandardInterfaces.h>
 #include <sdbus-c++/Types.h>
 
+#include "absl/synchronization/mutex.h"
 #include "internal/platform/implementation/linux/bluez_agent.h"
 #include "internal/platform/implementation/bluetooth_classic.h"
 #include "internal/platform/implementation/linux/bluetooth_adapter.h"
@@ -81,17 +83,13 @@ class BluetoothClassicMedium : public api::BluetoothClassicMedium {
       const std::string &service_name,
       const std::string &service_uuid) override;
 
-  // https://developer.android.com/reference/android/bluetooth/BluetoothDevice.html#createBond()
-  //
-  // Start the bonding (pairing) process with the remote device.
-  // Return a Bluetooth pairing instance to handle the pairing process with the
-  // remote device.
-  std::unique_ptr<api::BluetoothPairing> CreatePairing(
-      api::BluetoothDevice &remote_device) override;
-
   api::BluetoothDevice *GetRemoteDevice(MacAddress mac_address) override;
 
  private:
+  std::unique_ptr<api::BluetoothSocket> ConnectToServiceDirect(
+      api::BluetoothDevice &remote_device, const std::string &service_uuid,
+      CancellationFlag *cancellation_flag);
+
   std::shared_ptr<sdbus::IConnection> system_bus_;
 
   BluetoothAdapter adapter_;
@@ -100,6 +98,10 @@ class BluetoothClassicMedium : public api::BluetoothClassicMedium {
 
   std::unique_ptr<AgentManager> agent_manager_;
   std::unique_ptr<ProfileManager> profile_manager_;
+
+  absl::Mutex mac_only_devices_mutex_;
+  std::map<std::string, std::unique_ptr<api::BluetoothDevice>>
+      mac_only_devices_ ABSL_GUARDED_BY(mac_only_devices_mutex_);
 };
 
 }  // namespace linux
