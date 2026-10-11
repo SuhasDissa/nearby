@@ -22,6 +22,7 @@ Rectangle {
     property int transferredAttachmentsCount: 0
     property var totalBytes: 0
     property var transferredBytes: 0
+    property string speedText: ""
 
     signal returnHomeRequested()
 
@@ -106,6 +107,7 @@ Rectangle {
         status: root.status
         isFinalStatus: root.isFinalStatus
         totalBytes: root.totalBytes
+        speedText: root.speedText
         totalAttachmentsCount: root.totalAttachmentsCount
         transferredAttachmentsCount: root.transferredAttachmentsCount
         finalActionText: root.isFinalStatus ? "Go back home" : ""

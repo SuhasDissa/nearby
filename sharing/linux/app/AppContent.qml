@@ -9,7 +9,7 @@ RowLayout {
     anchors.fill: parent
     spacing: 0
 
-    property string pendingPath: ""
+    property var pendingPaths: []
     property int currentIndex: 0
     property var selectedTransferId: 0
     property var activeOutgoingTransferId: 0
@@ -36,17 +36,17 @@ RowLayout {
     Connections {
         target: EventBus
 
-        function onFileSelected(path) {
-            topLayout.pendingPath = path;
+        function onFilesSelected(paths) {
+            topLayout.pendingPaths = paths;
             startSharing();
         }
 
         function onShareTargetSelected(shareTargetId) {
-            if (topLayout.pendingPath.length === 0
+            if (topLayout.pendingPaths.length === 0
                     || topLayout.outgoingTransferActive) {
                 return;
             }
-            if (backend.sendFile(shareTargetId, topLayout.pendingPath)) {
+            if (backend.sendFiles(shareTargetId, topLayout.pendingPaths)) {
                 topLayout.outgoingStartFailed = false;
                 topLayout.activeOutgoingTransferId = shareTargetId;
             }
@@ -73,7 +73,7 @@ RowLayout {
     }
 
     function returnHome() {
-        pendingPath = "";
+        pendingPaths = [];
         selectedTransferId = 0;
         activeOutgoingTransferId = 0;
         outgoingStartFailed = false;
@@ -87,7 +87,7 @@ RowLayout {
     }
 
     Sidebar {
-        pendingPath: topLayout.pendingPath
+        pendingPaths: topLayout.pendingPaths
         cancelEnabled: !topLayout.outgoingTransferActive
     }
 
@@ -129,6 +129,7 @@ RowLayout {
                         status: model.status
                         totalBytes: model.totalBytes
                         transferredBytes: model.transferredBytes
+                        speedText: model.speedText
                         totalAttachmentsCount: model.totalAttachmentsCount
                         transferredAttachmentsCount: model.transferredAttachmentsCount
                         isFinalStatus: model.isFinalStatus
@@ -149,6 +150,24 @@ RowLayout {
                         font.pointSize: 18
                         font.weight: 600
                     }
+                }
+            }
+        }
+
+        Column {
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: 16
+            anchors.horizontalCenter: parent.horizontalCenter
+            width: Math.min(contentPane.width * 0.9, 700)
+            spacing: 8
+            z: 50
+
+            Repeater {
+                model: backend.issues
+
+                IssueBanner {
+                    width: parent.width
+                    issue: modelData
                 }
             }
         }
@@ -220,6 +239,7 @@ RowLayout {
                     isFinalStatus: outgoingNotification.terminal
                     cancelEnabled: !outgoingNotification.cancelPending
                     totalBytes: model.totalBytes
+                    speedText: model.speedText
                     totalAttachmentsCount: model.totalAttachmentsCount
                     transferredAttachmentsCount: model.transferredAttachmentsCount
                     onCancelRequested: {

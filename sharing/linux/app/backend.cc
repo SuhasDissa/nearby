@@ -9,21 +9,29 @@
 #include <utility>
 
 #include <QDebug>
+#include <QLocale>
 #include <QMetaObject>
 #include <QPointer>
 #include <QSysInfo>
 #include <QUrl>
+#include <QVariantMap>
 
 #include "absl/time/time.h"
 #include "connections/implementation/flags/nearby_connections_feature_flags.h"
 #include "internal/base/file_path.h"
 #include "internal/flags/nearby_flags.h"
+#include "internal/platform/implementation/platform.h"
 #include "sharing/advertisement.h"
 #include "sharing/file_attachment.h"
 #include "sharing/flags/generated/nearby_sharing_feature_flags.h"
 #include "sharing/nearby_sharing_service_factory.h"
 #include "sharing/nearby_sharing_settings.h"
 #include "sharing/proto/enums.pb.h"
+
+extern "C" int nearby_linux_pairing_prompt_count();
+extern "C" int nearby_linux_ble_advertising_ok();
+extern "C" void nearby_linux_copy_ble_advertising_error(char* buffer,
+                                                       int buffer_size);
 
 namespace {
 
@@ -32,6 +40,9 @@ using NearbySharingService = nearby::sharing::NearbySharingService;
 constexpr std::chrono::seconds kShutdownTimeout(10);
 constexpr int kReceiveTimeoutMilliseconds = 30 * 1000;
 constexpr int kIncomingOfferTimeoutMilliseconds = 45 * 1000;
+constexpr int kIssuesRefreshMilliseconds = 2000;
+constexpr qint64 kSpeedWindowMilliseconds = 1000;
+constexpr qint64 kMinSpeedSampleMilliseconds = 250;
 
 QString ToQString(const std::string& value) {
   return QString::fromStdString(value);
@@ -70,11 +81,23 @@ void ConfigureFlags() {
 }
 
 std::unique_ptr<nearby::sharing::AttachmentContainer> CreateFileAttachments(
-    const std::string& path) {
+    const std::vector<std::string>& paths) {
   nearby::sharing::AttachmentContainer::Builder builder;
-  builder.AddFileAttachment(
-      nearby::sharing::FileAttachment(nearby::FilePath(path)));
+  for (const std::string& path : paths) {
+    builder.AddFileAttachment(
+        nearby::sharing::FileAttachment(nearby::FilePath(path)));
+  }
   return builder.Build();
+}
+
+QVariantMap CreateIssue(const QString& kind, const QString& severity,
+                        const QString& title, const QString& detail) {
+  QVariantMap issue;
+  issue.insert(QStringLiteral("kind"), kind);
+  issue.insert(QStringLiteral("severity"), severity);
+  issue.insert(QStringLiteral("title"), title);
+  issue.insert(QStringLiteral("detail"), detail);
+  return issue;
 }
 
 NearbySharingService::StatusCodes ShutdownService(
@@ -201,7 +224,9 @@ int ShareTargetModel::IndexOf(int64_t target_id) const {
 }
 
 ShareTransferModel::ShareTransferModel(QObject* parent)
-    : QAbstractListModel(parent) {}
+    : QAbstractListModel(parent) {
+  clock_.start();
+}
 
 int ShareTransferModel::rowCount(const QModelIndex& parent) const {
   return parent.isValid() ? 0 : static_cast<int>(transfers_.size());
@@ -229,6 +254,7 @@ QHash<int, QByteArray> ShareTransferModel::roleNames() const {
       {IsFinalStatusRole, "isFinalStatus"},
       {AwaitingLocalConfirmationRole, "awaitingLocalConfirmation"},
       {LocalPathRole, "localPath"},
+      {SpeedTextRole, "speedText"},
   };
 }
 
@@ -249,8 +275,9 @@ void ShareTransferModel::ApplyTransfer(bool receive_mode,
   if (row < 0) {
     row = static_cast<int>(transfers_.size());
     beginInsertRows(QModelIndex(), row, row);
-    transfers_.push_back(
-        Row{target.id, receive_mode, target, transfer, total_bytes, {}});
+    Row new_row{target.id, receive_mode, target, transfer, total_bytes, {}};
+    UpdateSpeed(new_row);
+    transfers_.push_back(std::move(new_row));
     endInsertRows();
     return;
   }
@@ -259,6 +286,7 @@ void ShareTransferModel::ApplyTransfer(bool receive_mode,
   transfers_[row].target = target;
   transfers_[row].transfer = transfer;
   transfers_[row].total_bytes = total_bytes;
+  UpdateSpeed(transfers_[row]);
   EmitRowChanged(row);
 }
 
@@ -283,6 +311,8 @@ void ShareTransferModel::PrepareOutgoingTransfer(
   transfers_[row].transfer.reset();
   transfers_[row].total_bytes = 0;
   transfers_[row].local_path = local_path;
+  transfers_[row].speed_samples.clear();
+  transfers_[row].speed_text.clear();
   EmitRowChanged(row);
 }
 
@@ -293,6 +323,33 @@ int ShareTransferModel::IndexOf(int64_t target_id) const {
     }
   }
   return -1;
+}
+
+void ShareTransferModel::UpdateSpeed(Row& row) {
+  if (!row.transfer.has_value() ||
+      row.transfer->status() != TransferMetadata::Status::kInProgress) {
+    row.speed_samples.clear();
+    row.speed_text.clear();
+    return;
+  }
+
+  const qint64 now = clock_.elapsed();
+  row.speed_samples.push_back(
+      {now, static_cast<qint64>(row.transfer->transferred_bytes())});
+  while (row.speed_samples.size() > 2 &&
+         now - row.speed_samples.first().first > kSpeedWindowMilliseconds) {
+    row.speed_samples.removeFirst();
+  }
+  const qint64 elapsed =
+      row.speed_samples.last().first - row.speed_samples.first().first;
+  if (elapsed >= kMinSpeedSampleMilliseconds) {
+    const double rate = (row.speed_samples.last().second -
+                         row.speed_samples.first().second) *
+                        1000.0 / elapsed;
+    row.speed_text = QLocale().formattedDataSize(static_cast<qint64>(rate), 1,
+                                                 QLocale::DataSizeSIFormat) +
+                     QStringLiteral("/s");
+  }
 }
 
 QVariant ShareTransferModel::DataForRow(const Row& row, int role) const {
@@ -335,6 +392,8 @@ QVariant ShareTransferModel::DataForRow(const Row& row, int role) const {
                  TransferMetadata::Status::kAwaitingLocalConfirmation;
     case LocalPathRole:
       return row.local_path;
+    case SpeedTextRole:
+      return row.speed_text;
     default:
       return {};
   }
@@ -346,7 +405,7 @@ void ShareTransferModel::EmitRowChanged(int row) {
       {IdRole, DirectionRole, DeviceNameRole, StatusRole, ProgressRole,
        TransferredBytesRole, TotalBytesRole, TotalAttachmentsCountRole,
        TransferredAttachmentsCountRole, IsFinalStatusRole,
-       AwaitingLocalConfirmationRole, LocalPathRole});
+       AwaitingLocalConfirmationRole, LocalPathRole, SpeedTextRole});
 }
 
 void Backend::TransferCallback::OnTransferUpdate(
@@ -372,6 +431,13 @@ Backend::Backend(QObject* parent)
           &Backend::OnReceiveTimeout);
 
   ConfigureFlags();
+  try {
+    wifi_direct_ =
+        nearby::api::ImplementationPlatform::CreateWifiDirectMedium() !=
+        nullptr;
+  } catch (...) {
+    wifi_direct_ = false;
+  }
   service_ = nearby::sharing::NearbySharingServiceFactory::GetInstance()
                  ->CreateSharingService(*platform_, &analytics_recorder_,
                                         /*event_logger=*/nullptr,
@@ -381,6 +447,11 @@ Backend::Backend(QObject* parent)
     desired_mode_ = Mode::kNone;
     return;
   }
+
+  issues_timer_.setInterval(kIssuesRefreshMilliseconds);
+  connect(&issues_timer_, &QTimer::timeout, this, &Backend::RefreshIssues);
+  issues_timer_.start();
+  RefreshIssues();
 
   service_->GetSettings()->SetDataUsage(
       nearby::sharing::proto::WIFI_ONLY_DATA_USAGE);
@@ -452,27 +523,34 @@ void Backend::startDiscovery() {
   StopFastInitiationScanningForDiscovery();
 }
 
-bool Backend::sendFile(qint64 share_target_id, const QString& path) {
-  if (service_ == nullptr || shutting_down_) {
+bool Backend::sendFiles(qint64 share_target_id, const QStringList& paths) {
+  if (service_ == nullptr || shutting_down_ || paths.isEmpty()) {
     return false;
   }
-  const QString local_path = NormalizeLocalPath(path);
-  const std::string native_path = local_path.toStdString();
-  std::error_code error;
-  if (!std::filesystem::is_regular_file(native_path, error)) {
-    qWarning() << "Send file failed: path is not a regular file" << local_path;
-    return false;
+  std::vector<std::string> native_paths;
+  for (const QString& path : paths) {
+    const QString local_path = NormalizeLocalPath(path);
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(local_path.toStdString(), error)) {
+      qWarning() << "Send files failed: path is not a regular file"
+                 << local_path;
+      return false;
+    }
+    native_paths.push_back(local_path.toStdString());
   }
   const auto target = targets_.FindTarget(share_target_id);
   if (!target.has_value()) {
-    qWarning() << "Send file failed: unknown target" << share_target_id;
+    qWarning() << "Send files failed: unknown target" << share_target_id;
     return false;
   }
 
-  transfers_.PrepareOutgoingTransfer(share_target_id, local_path, target);
+  transfers_.PrepareOutgoingTransfer(
+      share_target_id,
+      paths.size() == 1 ? NormalizeLocalPath(paths.first()) : QString(),
+      target);
   QPointer<Backend> backend(this);
   service_->SendAttachments(
-      share_target_id, CreateFileAttachments(native_path),
+      share_target_id, CreateFileAttachments(native_paths),
       [backend, share_target_id](NearbySharingService::StatusCodes status) {
         if (!backend) {
           return;
@@ -481,13 +559,42 @@ bool Backend::sendFile(qint64 share_target_id, const QString& path) {
           if (!backend || backend->shutting_down_) {
             return;
           }
-          backend->ReportStatus(QStringLiteral("Send file"), status);
+          backend->ReportStatus(QStringLiteral("Send files"), status);
           if (status != NearbySharingService::StatusCodes::kOk) {
             emit backend->outgoingTransferStartFailed(share_target_id);
           }
         });
       });
   return true;
+}
+
+qint64 Backend::fileSize(const QString& path) const {
+  std::error_code error;
+  const auto size = std::filesystem::file_size(
+      NormalizeLocalPath(path).toStdString(), error);
+  return error ? 0 : static_cast<qint64>(size);
+}
+
+QString Backend::formatSize(qint64 bytes) const {
+  return QLocale().formattedDataSize(bytes, 1, QLocale::DataSizeSIFormat);
+}
+
+void Backend::setReceiveEnabled(bool enabled) {
+  if (receive_enabled_ == enabled) {
+    return;
+  }
+  receive_enabled_ = enabled;
+  emit receiveEnabledChanged();
+  RefreshIssues();
+  if (service_ == nullptr || shutting_down_ ||
+      active_mode_ == Mode::kDiscovery || desired_mode_ == Mode::kDiscovery ||
+      fast_init_scan_stop_in_flight_) {
+    return;
+  }
+  if (!enabled && !incoming_offer_timers_.isEmpty()) {
+    return;
+  }
+  StartFastInitiationMonitoring();
 }
 
 void Backend::accept(qint64 share_target_id) {
@@ -520,6 +627,7 @@ void Backend::shutdown() {
   shutting_down_ = true;
   monitoring_requested_ = false;
   receive_timeout_timer_.stop();
+  issues_timer_.stop();
   const QList<QTimer*> offer_timers = incoming_offer_timers_.values();
   incoming_offer_timers_.clear();
   for (QTimer* timer : offer_timers) {
@@ -774,7 +882,7 @@ void Backend::StartFastInitiationMonitoring() {
   receive_window_pending_ = false;
   receive_offer_received_ = false;
   receive_timeout_timer_.stop();
-  SetDesiredMode(Mode::kNone);
+  SetDesiredMode(receive_enabled_ ? Mode::kReceive : Mode::kNone);
   MaybeStartFastInitiationScanning();
 }
 
@@ -950,4 +1058,52 @@ void Backend::ReportStatus(const QString& operation,
         << operation + QStringLiteral(" failed: ") +
                ToQString(NearbySharingService::StatusCodeToString(status));
   }
+}
+
+void Backend::RefreshIssues() {
+  const QVariantList issues = BuildIssues();
+  if (issues != issues_) {
+    issues_ = issues;
+    emit issuesChanged();
+  }
+}
+
+QVariantList Backend::BuildIssues() const {
+  QVariantList issues;
+  if (service_ == nullptr || shutting_down_) {
+    return issues;
+  }
+  if (!service_->IsBluetoothPowered()) {
+    issues.push_back(CreateIssue(
+        QStringLiteral("bluetooth"), QStringLiteral("error"),
+        QStringLiteral("Bluetooth is off"),
+        QStringLiteral(
+            "Turn Bluetooth on so nearby devices can find this PC.")));
+  }
+  if (active_mode_ == Mode::kReceive && nearby_linux_ble_advertising_ok() == 0) {
+    char error[256] = {};
+    nearby_linux_copy_ble_advertising_error(error, sizeof(error));
+    issues.push_back(CreateIssue(
+        QStringLiteral("advertising"), QStringLiteral("error"),
+        QStringLiteral("Phones can't find this PC"),
+        QStringLiteral("Bluetooth advertising failed (%1). Restart the "
+                       "Bluetooth service and try again.")
+            .arg(QString::fromUtf8(error))));
+  }
+  if (nearby_linux_pairing_prompt_count() > 0) {
+    issues.push_back(CreateIssue(
+        QStringLiteral("pairing"), QStringLiteral("warning"),
+        QStringLiteral("Bluetooth pairing request"),
+        QStringLiteral(
+            "BlueZ is asking to pair with a device. Confirm the prompt on "
+            "this PC and on the phone to continue.")));
+  }
+  if (!wifi_direct_ && !service_->IsLanConnected()) {
+    issues.push_back(CreateIssue(
+        QStringLiteral("slow"), QStringLiteral("info"),
+        QStringLiteral("Large files will be slow"),
+        QStringLiteral("No Wi-Fi Direct or local network found, so transfers "
+                       "stay on Bluetooth.")));
+  }
+  return issues;
 }

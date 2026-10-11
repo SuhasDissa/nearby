@@ -35,6 +35,7 @@ qt_resource_via_qrc(
         "Targets.qml",
         "IncomingShare.qml",
         "TransferCard.qml",
+        "IssueBanner.qml",
         "googlesans_var.ttf",
         "icons/file.svg",
         "icons/laptop.svg",

@@ -21,13 +21,14 @@ Item {
     property int transferredAttachmentsCount: 0
     property var totalBytes: 0
     property string finalActionText: ""
+    property string speedText: ""
 
     signal cancelRequested()
     signal finalActionRequested()
 
     function baseName(path) {
         if (!path || path.length === 0) {
-            return direction === "send" ? "Selected file" : transferSummary()
+            return direction === "send" && totalAttachmentsCount <= 1 ? "Selected file" : transferSummary()
         }
         const normalized = decodeURIComponent(path).replace("file://", "")
         const parts = normalized.split("/")
@@ -179,6 +180,13 @@ Item {
                     font.pointSize: root.compact ? 10 : 12
                     Layout.fillWidth: true
                     elide: Text.ElideRight
+                }
+
+                Text {
+                    visible: !root.isFinalStatus && root.speedText.length > 0
+                    text: root.speedText
+                    color: "#57707A"
+                    font.pointSize: root.compact ? 10 : 12
                 }
 
                 Text {

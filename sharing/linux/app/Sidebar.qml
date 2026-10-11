@@ -9,7 +9,7 @@ Rectangle {
     Layout.fillHeight: true
     Layout.preferredWidth: 300
 
-    property string pendingPath: ""
+    property var pendingPaths: []
     property bool cancelEnabled: true
 
     color: "#CBF0FF"
@@ -65,11 +65,35 @@ Rectangle {
                     text: "This cannot be changed due to limitations in QuickShare on Linux"
                     color: "gray"
                 }
+
+                RowLayout {
+                    Layout.topMargin: 20
+                    Layout.fillWidth: true
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: "Always receive"
+                        font.weight: 500
+                        color: "#377B95"
+                    }
+
+                    Switch {
+                        checked: backend.receiveEnabled
+                        onToggled: backend.receiveEnabled = checked
+                    }
+                }
+
+                Text {
+                    Layout.preferredWidth: parent.width
+                    wrapMode: Text.WordWrap
+                    text: "Stay visible for incoming shares instead of waiting for a nearby sender"
+                    color: "gray"
+                }
             }
         }
 
         Rectangle {
-            visible: pendingPath.length != 0
+            visible: pendingPaths.length != 0
             Layout.preferredHeight: 350
             Layout.fillWidth: true
             border.color: "#91C8DE"
@@ -103,7 +127,9 @@ Rectangle {
                     Layout.fillWidth: true
                     color: "gray"
                     wrapMode: Text.WordWrap
-                    text: decodeURIComponent(pendingPath).replace("file://", "")
+                    text: pendingPaths.length === 1
+                          ? decodeURIComponent(pendingPaths[0]).replace("file://", "")
+                          : pendingPaths.length + " files"
                     horizontalAlignment: Text.AlignHCenter
                 }
                 Button {

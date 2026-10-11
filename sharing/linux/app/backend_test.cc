@@ -411,3 +411,35 @@ TEST_F(BackendFastInitiationTest, ScanErrorUsesOneFallbackWindowThenIdles) {
 }
 
 }  // namespace
+
+TEST_F(BackendFastInitiationTest, ReceiveEnabledStaysReceivingWithoutTimeout) {
+  backend_->setReceiveEnabled(true);
+  DrainEvents();
+
+  EXPECT_TRUE(BackendTestPeer::IsReceiving(*backend_));
+  EXPECT_FALSE(BackendTestPeer::IsReceiveTimerActive(*backend_));
+}
+
+TEST_F(BackendFastInitiationTest, ReceiveDisabledReturnsToFastInitiation) {
+  backend_->setReceiveEnabled(true);
+  DrainEvents();
+  backend_->setReceiveEnabled(false);
+  DrainEvents();
+
+  EXPECT_TRUE(BackendTestPeer::IsIdle(*backend_));
+  EXPECT_TRUE(fast_init_manager_.IsScanning());
+}
+
+TEST_F(BackendFastInitiationTest, ReceiveEnabledResumesAfterDiscovery) {
+  backend_->setReceiveEnabled(true);
+  DrainEvents();
+  backend_->startDiscovery();
+  fast_init_manager_.CompleteStop();
+  DrainEvents();
+  ASSERT_TRUE(BackendTestPeer::IsDiscovering(*backend_));
+
+  backend_->startReceive();
+  DrainEvents();
+  EXPECT_TRUE(BackendTestPeer::IsReceiving(*backend_));
+  EXPECT_FALSE(BackendTestPeer::IsReceiveTimerActive(*backend_));
+}

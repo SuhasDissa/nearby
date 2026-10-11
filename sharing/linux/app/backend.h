@@ -8,11 +8,16 @@
 #include <vector>
 
 #include <QAbstractListModel>
+#include <QElapsedTimer>
 #include <QHash>
+#include <QList>
 #include <QObject>
+#include <QPair>
 #include <QSet>
 #include <QString>
+#include <QStringList>
 #include <QTimer>
+#include <QVariantList>
 
 #include "QtQmlIntegration/qqmlintegration.h"
 #include "qtmetamacros.h"
@@ -74,6 +79,7 @@ class ShareTransferModel : public QAbstractListModel {
     IsFinalStatusRole,
     AwaitingLocalConfirmationRole,
     LocalPathRole,
+    SpeedTextRole,
   };
 
   explicit ShareTransferModel(QObject* parent = nullptr);
@@ -96,13 +102,17 @@ class ShareTransferModel : public QAbstractListModel {
     std::optional<TransferMetadata> transfer;
     int64_t total_bytes = 0;
     QString local_path;
+    QList<QPair<qint64, qint64>> speed_samples;
+    QString speed_text;
   };
 
   int IndexOf(int64_t target_id) const;
+  void UpdateSpeed(Row& row);
   QVariant DataForRow(const Row& row, int role) const;
   void EmitRowChanged(int row);
 
   std::vector<Row> transfers_;
+  QElapsedTimer clock_;
 };
 
 class Backend : public QObject,
@@ -112,6 +122,9 @@ class Backend : public QObject,
   Q_PROPERTY(QString hostname READ hostname CONSTANT)
   Q_PROPERTY(QAbstractListModel* targets READ targets CONSTANT)
   Q_PROPERTY(QAbstractListModel* transfers READ transfers CONSTANT)
+  Q_PROPERTY(QVariantList issues READ issues NOTIFY issuesChanged)
+  Q_PROPERTY(bool receiveEnabled READ receiveEnabled WRITE setReceiveEnabled
+                 NOTIFY receiveEnabledChanged)
 
  public:
   explicit Backend(QObject* parent = nullptr);
@@ -120,10 +133,15 @@ class Backend : public QObject,
   QString hostname() const;
   QAbstractListModel* targets() { return &targets_; }
   QAbstractListModel* transfers() { return &transfers_; }
+  QVariantList issues() const { return issues_; }
+  bool receiveEnabled() const { return receive_enabled_; }
 
   Q_INVOKABLE void startReceive();
   Q_INVOKABLE void startDiscovery();
-  Q_INVOKABLE bool sendFile(qint64 share_target_id, const QString& path);
+  Q_INVOKABLE bool sendFiles(qint64 share_target_id, const QStringList& paths);
+  Q_INVOKABLE qint64 fileSize(const QString& path) const;
+  Q_INVOKABLE QString formatSize(qint64 bytes) const;
+  Q_INVOKABLE void setReceiveEnabled(bool enabled);
   Q_INVOKABLE void accept(qint64 share_target_id);
   Q_INVOKABLE void reject(qint64 share_target_id);
   Q_INVOKABLE void cancel(qint64 share_target_id);
@@ -137,6 +155,8 @@ class Backend : public QObject,
   void transferFinished(qint64 share_target_id, bool receive_mode,
                         QString device_name, QString status);
   void outgoingTransferStartFailed(qint64 share_target_id);
+  void issuesChanged();
+  void receiveEnabledChanged();
 
  private:
   friend class BackendTestPeer;
@@ -199,6 +219,8 @@ class Backend : public QObject,
       QString operation);
   void ReportStatus(const QString& operation,
                     NearbySharingService::StatusCodes status);
+  void RefreshIssues();
+  QVariantList BuildIssues() const;
 
   ShareTargetModel targets_;
   ShareTransferModel transfers_;
@@ -209,6 +231,8 @@ class Backend : public QObject,
   TransferCallback send_transfer_callback_;
   TransferCallback receive_transfer_callback_;
   QTimer receive_timeout_timer_;
+  QTimer issues_timer_;
+  QVariantList issues_;
   QHash<qint64, QTimer*> incoming_offer_timers_;
   QSet<qint64> finished_transfer_ids_;
   Mode active_mode_ = Mode::kNone;
@@ -223,5 +247,7 @@ class Backend : public QObject,
   bool receive_offer_received_ = false;
   bool fallback_receive_window_ = false;
   bool fallback_receive_used_ = false;
+  bool wifi_direct_ = false;
+  bool receive_enabled_ = false;
   bool shutting_down_ = false;
 };
