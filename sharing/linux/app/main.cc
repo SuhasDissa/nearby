@@ -2,8 +2,6 @@
 #include <signal.h>
 #include <unistd.h>
 
-#include <memory>
-
 #include <QDir>
 #include <QFileInfo>
 #include <QFileSystemWatcher>
@@ -18,15 +16,19 @@
 #include <QQmlContext>
 #include "application_controller.h"
 #include "backend.h"
-#include "qobject.h"
-#include "sharing/linux/app/native_file_logging.h"
+#include "file_dialogs.h"
+#include "quickshare.h"
 
 namespace {
 
 constexpr char kQmlHotReloadEnv[] = "NEARBY_QML_HOT_RELOAD";
 constexpr char kQmlSourceDirEnv[] = "NEARBY_QML_SOURCE_DIR";
-constexpr char kDefaultQmlSourceDir[] =
-    "/home/lasan/Dev/nearby_latest/sharing/linux/app";
+constexpr char kDefaultQmlSourceDir[] = QUICKSHARE_QML_SOURCE_DIR;
+
+struct LoggingScope {
+  LoggingScope() { quickshare_logging_init(); }
+  ~LoggingScope() { quickshare_logging_shutdown(); }
+};
 
 int g_signal_pipe[2] = {-1, -1};
 
@@ -115,12 +117,25 @@ void InstallTerminationCleanup(QApplication& app) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
-  std::unique_ptr<nearby::sharing::linux::NativeFileLogging> native_logging =
-      nearby::sharing::linux::NativeFileLogging::Initialize();
+  LoggingScope logging;
+
+  // The AppImage bundles no gtk3/kde theme plugin, so file dialogs would fall
+  // back to Qt's own. The portal plugin is bundled but Qt only selects it
+  // inside Flatpak/Snap. linuxdeploy's AppRun hook sets "gtk2" on GNOME/XFCE,
+  // which is never bundled, so replace that too.
+  if (qEnvironmentVariableIsSet("APPIMAGE")) {
+    const QByteArray theme = qgetenv("QT_QPA_PLATFORMTHEME");
+    if (theme.isEmpty() || theme == "gtk2") {
+      qputenv("QT_QPA_PLATFORMTHEME", "xdgdesktopportal");
+    }
+  }
+
+  // QApplication (not QGuiApplication) is required so QFileDialog can use the
+  // native platform file picker, which routes through xdg-desktop-portal.
   QApplication app(argc, argv);
   app.setApplicationName(QStringLiteral("QuickShare"));
-  app.setOrganizationDomain(QStringLiteral("com.google"));
-  app.setDesktopFileName(QStringLiteral("quickshare"));
+  app.setOrganizationDomain(QStringLiteral("io.github.quickshare_linux"));
+  app.setDesktopFileName(QStringLiteral("io.github.quickshare_linux.QuickShare"));
   app.setWindowIcon(QIcon(QStringLiteral(":/icons/quickshare.svg")));
   app.setQuitOnLastWindowClosed(false);
 
@@ -138,6 +153,8 @@ int main(int argc, char* argv[]) {
   engine.rootContext()->setContextProperty("backend", &backend);
   engine.rootContext()->setContextProperty("appController",
                                            &application_controller);
+  FileDialogs file_dialogs;
+  engine.rootContext()->setContextProperty("fileDialogs", &file_dialogs);
   QObject::connect(&engine, &QQmlApplicationEngine::objectCreated,
                    &application_controller,
                    [&application_controller](QObject* object, const QUrl&) {

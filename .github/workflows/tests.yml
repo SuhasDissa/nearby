@@ -1,0 +1,148 @@
+name: Tests
+
+# Builds and tests on every push and pull request. package.yml builds the same things, but only
+# on a manual dispatch (build.yml) or a release tag (release.yml) - this is what keeps a
+# regression from sitting on the branch until release day. It builds the way package.yml's
+# appimage job does and then stops: no install tree, no packages, no artifacts.
+on:
+  push:
+  pull_request:
+
+# A second push to the same ref makes the in-flight run irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  QT_VERSION: "6.10.*"
+
+jobs:
+  linux:
+    name: Build and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set up Bazelisk
+        uses: bazel-contrib/setup-bazel@0.18.0
+        with:
+          bazelisk-cache: true
+          # Its own key: package.yml's appimage cache is only refreshed on dispatches and tags,
+          # this one on every push.
+          disk-cache: tests
+          repository-cache: true
+
+      # Same list as package.yml's appimage job minus patchelf (no AppImage here), plus dbus for
+      # the isolated session bus the Qt tests run on.
+      - name: Install native build dependencies
+        timeout-minutes: 10
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          # Runner image adds packages.microsoft.com; azure-cli.list is the one *microsoft* misses.
+          # GitHub's apt-mirrors.txt tries azure.archive then archive.ubuntu.com; both stall.
+          sudo rm -f /etc/apt/sources.list.d/*microsoft* /etc/apt/sources.list.d/*azure-cli*
+          printf '%s\n' 'Acquire::http::Timeout "10";' 'Acquire::https::Timeout "10";' \
+            'Acquire::Retries "2";' 'APT::Acquire::Retries "2";' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          {
+            curl -fsSL --max-time 8 http://mirrors.ubuntu.com/mirrors.txt || true
+            echo "http://us.archive.ubuntu.com/ubuntu/"
+            echo "http://security.ubuntu.com/ubuntu/"
+          } | sed 's:/*$:/:' \
+            | grep -vi 'azure.archive.ubuntu.com' \
+            | grep -viE '^https?://archive\.ubuntu\.com/' \
+            | awk 'NF && !seen[$0]++' \
+            | awk '{ printf "%s\tpriority:%d\n", $0, NR }' \
+            | sudo tee /etc/apt/apt-mirrors.txt
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y -o Acquire::Retries=3 ca-certificates gnupg wget
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | gpg --dearmor \
+            | sudo tee /usr/share/keyrings/apt.llvm.org.gpg >/dev/null
+          echo "deb [signed-by=/usr/share/keyrings/apt.llvm.org.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-21.list
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y -o Acquire::Retries=3 \
+            build-essential ninja-build pkg-config git dbus \
+            clang-21 \
+            libssl-dev libcurl4-openssl-dev libsystemd-dev libbluetooth-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libfontconfig1-dev libfreetype6-dev libglib2.0-dev libdbus-1-dev \
+            libwayland-dev \
+            libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev libxi-dev libxrender-dev \
+            libxcb1-dev libxcb-glx0-dev libxcb-keysyms1-dev libxcb-image0-dev libxcb-shm0-dev \
+            libxcb-icccm4-dev libxcb-sync-dev libxcb-xfixes0-dev libxcb-shape0-dev \
+            libxcb-randr0-dev libxcb-render-util0-dev libxcb-xinerama0-dev libxcb-cursor-dev
+          # The runner image already ships an older clang as /usr/bin/clang, so point Bazel at
+          # clang-21 through the user.bazelrc that .bazelrc try-imports.
+          printf '%s\n' \
+            'build --action_env=CC=clang-21 --action_env=CXX=clang++-21' \
+            'build --repo_env=CC=clang-21 --repo_env=CXX=clang++-21' > user.bazelrc
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          cache: true
+          add-tools-to-path: true
+
+      # The library the app ships plus the CLI, so a break in the Linux platform layer shows up
+      # even when nothing the Qt app calls is affected.
+      - name: Build Nearby
+        run: |
+          bazel build \
+            --@com_google_protobuf//bazel/toolchains:prefer_prebuilt_protoc=true \
+            --copt='-DGITHUB_BUILD' \
+            //sharing/linux/lib:quickshare \
+            //sharing/linux:nearby_sharing_cli
+
+      - name: Test Nearby
+        run: |
+          bazel test \
+            --@com_google_protobuf//bazel/toolchains:prefer_prebuilt_protoc=true \
+            --copt='-DGITHUB_BUILD' \
+            --test_output=errors \
+            //sharing/linux/lib:native_file_logging_test \
+            //sharing/linux:nearby_fast_init_manager_test
+
+      - name: Configure
+        run: |
+          cmake -S sharing/linux/app -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${QT_ROOT_DIR}" \
+            -DQUICKSHARE_LIB_DIR="${GITHUB_WORKSPACE}/bazel-bin/sharing/linux/lib"
+
+      # Everything, not just the test targets, so the app link and resource compilation are
+      # covered on every push too.
+      - name: Build app
+        run: cmake --build build --parallel
+
+      # application_controller_test owns the single-instance name and calls the notification
+      # service, so it gets a private session bus rather than whatever the runner has (usually
+      # none). offscreen is enough: neither suite renders.
+      - name: Test app
+        id: test
+        run: |
+          QT_QPA_PLATFORM=offscreen dbus-run-session -- \
+            ctest --test-dir build --output-on-failure --timeout 120 --output-log ctest.log
+
+      - name: Summarize test failures
+        if: failure() && steps.test.outcome == 'failure'
+        shell: bash
+        run: |
+          {
+            echo "### Failed tests"
+            echo '```'
+            sed -n '/^The following tests FAILED:/,/^Errors while running CTest/p' ctest.log | grep -v '^Errors while running CTest'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

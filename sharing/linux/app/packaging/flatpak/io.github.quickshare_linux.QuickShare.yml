@@ -1,0 +1,116 @@
+app-id: io.github.quickshare_linux.QuickShare
+runtime: org.kde.Platform
+runtime-version: "6.10"
+sdk: org.kde.Sdk
+# clang for Bazel: .bazelrc pins CC/CXX to plain clang/clang++ and org.kde.Sdk ships gcc only.
+# The extension is build-time only; nothing from it ends up in /app. KDE 6.10 sits on
+# freedesktop 25.08; llvm21 because gloop requires Clang 21 or later.
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.llvm21
+command: quickshare
+
+finish-args:
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  # OpenGL scene graph for the Qt Quick UI.
+  - --device=dri
+  # Peers on the LAN (Wi-Fi LAN transfers, mDNS discovery).
+  - --share=network
+  # Raw L2CAP/RFCOMM sockets for BLE advertising and Bluetooth Classic transfers.
+  - --allow=bluetooth
+  # Adapter control, advertising and device discovery all go through BlueZ.
+  - --system-talk-name=org.bluez
+  # Wi-Fi Direct / hotspot connections used for high-bandwidth transfers.
+  - --system-talk-name=org.freedesktop.NetworkManager
+  # mDNS service advertisement and browsing.
+  - --system-talk-name=org.freedesktop.Avahi
+  # Incoming-transfer notifications.
+  - --talk-name=org.freedesktop.Notifications
+  # System tray icon; the app keeps running in the tray after its window is closed.
+  - --talk-name=org.kde.StatusNotifierWatcher
+  # Qt registers the tray item as org.kde.StatusNotifierItem-<pid>-<n>. Flatpak wildcards only
+  # match whole name components, so a prefix like StatusNotifierItem-* is rejected.
+  - --own-name=org.kde.*
+  # Received files land in the XDG download directory. Sending uses the QFileDialog portal
+  # (the app deliberately uses QApplication), so no broader filesystem access is granted.
+  - --filesystem=xdg-download
+
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /lib/cmake
+
+modules:
+  # Bazel 9 (see .bazelversion) is fetched by bazelisk on first use. Pinned as a file source so
+  # the manifest does not depend on a package that org.kde.Sdk does not ship.
+  - name: bazelisk
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 bazelisk ${FLATPAK_DEST}/bin/bazelisk
+    sources:
+      - type: file
+        url: https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-amd64
+        sha256: e1508323f347ad1465a887bc5d2bfb91cffc232d11e8e997b623227c6b32fb76
+        dest-filename: bazelisk
+        only-arches:
+          - x86_64
+      - type: file
+        url: https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-arm64
+        sha256: bb608519a440d45d10304eb684a73a2b6bb7699c5b0e5434361661b25f113a5d
+        dest-filename: bazelisk
+        only-arches:
+          - aarch64
+    cleanup:
+      - /bin/bazelisk
+
+  # libsystemd, libbluetooth and libcurl headers are all in org.kde.Sdk already, and the runtime
+  # carries the matching shared objects, so no system-library modules are needed.
+  #
+  # buildsystem: simple because libquickshare.so is built by Bazel first and CMake then imports
+  # it; flatpak-builder has no hook for a step before configure.
+  - name: quickshare
+    buildsystem: simple
+    # The tree is unpacked into src/ so Bazel's output root (.bazel) sits beside the workspace:
+    # Bazel 9 refuses to run with its repo contents cache inside the main repo.
+    subdir: src
+    build-options:
+      append-path: /usr/lib/sdk/llvm21/bin
+      # Bazel downloads its toolchains and module dependencies (and CMake fetches googletest).
+      # Acceptable for a CI-built bundle; Flathub would need all of it vendored.
+      build-args:
+        - --share=network
+      env:
+        BAZELISK_HOME: /run/build/quickshare/.bazelisk
+    build-commands:
+      # --output_user_root keeps Bazel's state inside the build dir: the sandbox HOME is not
+      # writable in the way Bazel expects. --repo_env=PATH/--action_env=PATH put the llvm21
+      # clang (added to PATH above) in front of Bazel's repository rules and actions, which
+      # otherwise run with a normalized PATH. -DGITHUB_BUILD and the prebuilt protoc mirror
+      # .github/workflows/validate.yaml.
+      - bazelisk --output_user_root=/run/build/quickshare/.bazel build
+        --jobs=${FLATPAK_BUILDER_N_JOBS}
+        --repo_env=PATH --action_env=PATH
+        --@com_google_protobuf//bazel/toolchains:prefer_prebuilt_protoc=true
+        --copt=-DGITHUB_BUILD
+        //sharing/linux/lib:quickshare
+      - cmake -S sharing/linux/app -B build-app -G Ninja
+        -DCMAKE_INSTALL_PREFIX=/app
+        -DCMAKE_BUILD_TYPE=Release
+        -DQUICKSHARE_LIB_DIR=/run/build/quickshare/src/bazel-bin/sharing/linux/lib
+      - cmake --build build-app --parallel ${FLATPAK_BUILDER_N_JOBS}
+      - cmake --install build-app
+      # Bazel leaves its output root read-only, so flatpak-builder cannot remove the build dir.
+      - chmod -R u+w /run/build/quickshare/.bazel
+    sources:
+      - type: dir
+        path: ../../../../..
+        dest: src
+        skip:
+          - .git
+          - .flatpak-builder
+          - build
+          - bazel-bin
+          - bazel-nearby
+          - bazel-out
+          - bazel-testlogs

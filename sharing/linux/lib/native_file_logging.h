@@ -1,5 +1,5 @@
-#ifndef SHARING_LINUX_APP_NATIVE_FILE_LOGGING_H_
-#define SHARING_LINUX_APP_NATIVE_FILE_LOGGING_H_
+#ifndef SHARING_LINUX_LIB_NATIVE_FILE_LOGGING_H_
+#define SHARING_LINUX_LIB_NATIVE_FILE_LOGGING_H_
 
 #include <cstddef>
 #include <filesystem>
@@ -65,4 +65,4 @@ class NativeFileLogging final {
 
 }  // namespace nearby::sharing::linux
 
-#endif  // SHARING_LINUX_APP_NATIVE_FILE_LOGGING_H_
+#endif  // SHARING_LINUX_LIB_NATIVE_FILE_LOGGING_H_

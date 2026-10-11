@@ -1,11 +1,10 @@
 #include "sharing/linux/app/backend.h"
 
 #include <algorithm>
-#include <chrono>
-#include <condition_variable>
 #include <filesystem>
 #include <functional>
-#include <mutex>
+#include <memory>
+#include <string>
 #include <utility>
 
 #include <QDebug>
@@ -16,78 +15,33 @@
 #include <QUrl>
 #include <QVariantMap>
 
-#include "absl/time/time.h"
-#include "connections/implementation/flags/nearby_connections_feature_flags.h"
-#include "internal/base/file_path.h"
-#include "internal/flags/nearby_flags.h"
-#include "internal/platform/implementation/platform.h"
-#include "sharing/advertisement.h"
-#include "sharing/file_attachment.h"
-#include "sharing/flags/generated/nearby_sharing_feature_flags.h"
-#include "sharing/nearby_sharing_service_factory.h"
-#include "sharing/nearby_sharing_settings.h"
-#include "sharing/proto/enums.pb.h"
-
-extern "C" int nearby_linux_pairing_prompt_count();
-extern "C" int nearby_linux_ble_advertising_ok();
-extern "C" void nearby_linux_copy_ble_advertising_error(char* buffer,
-                                                       int buffer_size);
-
 namespace {
 
-using NearbySharingService = nearby::sharing::NearbySharingService;
-
-constexpr std::chrono::seconds kShutdownTimeout(10);
 constexpr int kReceiveTimeoutMilliseconds = 30 * 1000;
 constexpr int kIncomingOfferTimeoutMilliseconds = 45 * 1000;
 constexpr int kIssuesRefreshMilliseconds = 2000;
 constexpr qint64 kSpeedWindowMilliseconds = 1000;
 constexpr qint64 kMinSpeedSampleMilliseconds = 250;
 
-QString ToQString(const std::string& value) {
-  return QString::fromStdString(value);
-}
+using StatusHandler = std::function<void(int)>;
 
 QString NormalizeLocalPath(const QString& path) {
   const QUrl url(path);
   return url.isValid() && url.isLocalFile() ? url.toLocalFile() : path;
 }
 
-void ConfigureFlags() {
-  nearby::NearbyFlags::GetInstance().OverrideBoolFlagValue(
-      nearby::sharing::config_package_nearby::nearby_sharing_feature::
-          kEnableBleForTransfer,
-      true);
-  nearby::NearbyFlags::GetInstance().OverrideBoolFlagValue(
-      nearby::connections::config_package_nearby::nearby_connections_feature::
-          kEnableBleL2cap,
-      true);
-  nearby::NearbyFlags::GetInstance().OverrideBoolFlagValue(
-      nearby::connections::config_package_nearby::nearby_connections_feature::
-          kRefactorBleL2cap,
-      true);
-  nearby::NearbyFlags::GetInstance().OverrideBoolFlagValue(
-      nearby::connections::config_package_nearby::nearby_connections_feature::
-          kEnableDynamicRoleSwitch,
-      true);
-  nearby::NearbyFlags::GetInstance().OverrideBoolFlagValue(
-      nearby::connections::config_package_nearby::nearby_connections_feature::
-          kEnableWifiDirect,
-      true);
-  nearby::NearbyFlags::GetInstance().OverrideBoolFlagValue(
-      nearby::connections::config_package_nearby::nearby_connections_feature::
-          kEnableWifiDirectGcOnly,
-      true);
+ShareTargetInfo ToTargetInfo(const QuickShareTarget& target) {
+  return {target.id, QString::fromUtf8(target.device_name), target.type};
 }
 
-std::unique_ptr<nearby::sharing::AttachmentContainer> CreateFileAttachments(
-    const std::vector<std::string>& paths) {
-  nearby::sharing::AttachmentContainer::Builder builder;
-  for (const std::string& path : paths) {
-    builder.AddFileAttachment(
-        nearby::sharing::FileAttachment(nearby::FilePath(path)));
-  }
-  return builder.Build();
+TransferInfo ToTransferInfo(const QuickShareTransfer& transfer) {
+  return {transfer.status,
+          QString::fromUtf8(transfer.status_name),
+          transfer.progress_percent,
+          transfer.transferred_bytes,
+          transfer.total_attachments_count,
+          transfer.transferred_attachments_count,
+          transfer.is_final_status != 0};
 }
 
 QVariantMap CreateIssue(const QString& kind, const QString& severity,
@@ -100,28 +54,9 @@ QVariantMap CreateIssue(const QString& kind, const QString& severity,
   return issue;
 }
 
-NearbySharingService::StatusCodes ShutdownService(
-    NearbySharingService& service) {
-  struct State {
-    std::mutex mutex;
-    std::condition_variable cv;
-    std::optional<NearbySharingService::StatusCodes> status;
-  };
-  auto state = std::make_shared<State>();
-  service.Shutdown([state](NearbySharingService::StatusCodes status) {
-    {
-      std::lock_guard<std::mutex> lock(state->mutex);
-      state->status = status;
-    }
-    state->cv.notify_one();
-  });
-
-  std::unique_lock<std::mutex> lock(state->mutex);
-  if (!state->cv.wait_for(lock, kShutdownTimeout,
-                          [&] { return state->status.has_value(); })) {
-    return NearbySharingService::StatusCodes::kError;
-  }
-  return *state->status;
+void StatusThunk(int status, void* user) {
+  std::unique_ptr<StatusHandler> handler(static_cast<StatusHandler*>(user));
+  (*handler)(status);
 }
 
 void PostStatus(Backend* backend, std::function<void()> callback) {
@@ -137,6 +72,23 @@ void PostStatus(Backend* backend, std::function<void()> callback) {
         }
       },
       Qt::QueuedConnection);
+}
+
+// Completion handler that hands the status to the GUI thread.
+StatusHandler* PostedStatus(Backend* backend,
+                            std::function<void(Backend&, int)> callback) {
+  QPointer<Backend> guarded_backend(backend);
+  return new StatusHandler(
+      [guarded_backend, callback = std::move(callback)](int status) {
+        if (!guarded_backend) {
+          return;
+        }
+        PostStatus(guarded_backend, [guarded_backend, callback, status]() {
+          if (guarded_backend) {
+            callback(*guarded_backend, status);
+          }
+        });
+      });
 }
 
 }  // namespace
@@ -159,7 +111,7 @@ QVariant ShareTargetModel::data(const QModelIndex& index, int role) const {
     case IdRole:
       return QVariant::fromValue<qint64>(target.id);
     case DeviceNameRole:
-      return ToQString(target.device_name);
+      return target.device_name;
     case TypeRole:
       return static_cast<int>(target.type);
     default:
@@ -327,7 +279,7 @@ int ShareTransferModel::IndexOf(int64_t target_id) const {
 
 void ShareTransferModel::UpdateSpeed(Row& row) {
   if (!row.transfer.has_value() ||
-      row.transfer->status() != TransferMetadata::Status::kInProgress) {
+      row.transfer->status != QUICKSHARE_TRANSFER_IN_PROGRESS) {
     row.speed_samples.clear();
     row.speed_text.clear();
     return;
@@ -335,7 +287,7 @@ void ShareTransferModel::UpdateSpeed(Row& row) {
 
   const qint64 now = clock_.elapsed();
   row.speed_samples.push_back(
-      {now, static_cast<qint64>(row.transfer->transferred_bytes())});
+      {now, static_cast<qint64>(row.transfer->transferred_bytes)});
   while (row.speed_samples.size() > 2 &&
          now - row.speed_samples.first().first > kSpeedWindowMilliseconds) {
     row.speed_samples.removeFirst();
@@ -362,34 +314,31 @@ QVariant ShareTransferModel::DataForRow(const Row& row, int role) const {
       return row.receive_mode ? QStringLiteral("receive")
                               : QStringLiteral("send");
     case DeviceNameRole:
-      return target.has_value() && !target->device_name.empty()
-                 ? ToQString(target->device_name)
+      return target.has_value() && !target->device_name.isEmpty()
+                 ? target->device_name
                  : QStringLiteral("Unknown device");
     case StatusRole:
-      return transfer.has_value() ? ToQString(TransferMetadata::StatusToString(
-                                        transfer->status()))
-                                  : QString();
+      return transfer.has_value() ? transfer->status_name : QString();
     case ProgressRole:
       return transfer.has_value()
-                 ? std::clamp(static_cast<double>(transfer->progress()) / 100.0,
+                 ? std::clamp(transfer->progress_percent / 100.0,
                               0.0, 1.0)
                  : 0.0;
     case TransferredBytesRole:
       return QVariant::fromValue<qulonglong>(
-          transfer.has_value() ? transfer->transferred_bytes() : 0);
+          transfer.has_value() ? transfer->transferred_bytes : 0);
     case TotalBytesRole:
       return QVariant::fromValue<qint64>(row.total_bytes);
     case TotalAttachmentsCountRole:
-      return transfer.has_value() ? transfer->total_attachments_count() : 0;
+      return transfer.has_value() ? transfer->total_attachments_count : 0;
     case TransferredAttachmentsCountRole:
-      return transfer.has_value() ? transfer->transferred_attachments_count()
+      return transfer.has_value() ? transfer->transferred_attachments_count
                                   : 0;
     case IsFinalStatusRole:
-      return transfer.has_value() && transfer->is_final_status();
+      return transfer.has_value() && transfer->is_final_status;
     case AwaitingLocalConfirmationRole:
       return transfer.has_value() &&
-             transfer->status() ==
-                 TransferMetadata::Status::kAwaitingLocalConfirmation;
+             transfer->status == QUICKSHARE_TRANSFER_AWAITING_LOCAL_CONFIRMATION;
     case LocalPathRole:
       return row.local_path;
     case SpeedTextRole:
@@ -408,111 +357,90 @@ void ShareTransferModel::EmitRowChanged(int row) {
        AwaitingLocalConfirmationRole, LocalPathRole, SpeedTextRole});
 }
 
-void Backend::TransferCallback::OnTransferUpdate(
-    const ShareTarget& share_target,
-    const nearby::sharing::AttachmentContainer& attachment_container,
-    const TransferMetadata& transfer_metadata) {
-  backend_.OnTransferUpdate(receive_mode_, share_target, attachment_container,
-                            transfer_metadata);
-}
-
 Backend::Backend(QObject* parent)
-    : QObject(parent),
-      targets_(this),
-      transfers_(this),
-      platform_(
-          std::make_unique<nearby::sharing::linux::LinuxSharingPlatform>()),
-      fast_init_manager_(&platform_->GetFastInitiationManager()),
-      send_transfer_callback_(*this, false),
-      receive_transfer_callback_(*this, true) {
+    : QObject(parent), targets_(this), transfers_(this) {
   receive_timeout_timer_.setSingleShot(true);
   receive_timeout_timer_.setInterval(kReceiveTimeoutMilliseconds);
   connect(&receive_timeout_timer_, &QTimer::timeout, this,
           &Backend::OnReceiveTimeout);
 
-  ConfigureFlags();
-  try {
-    wifi_direct_ =
-        nearby::api::ImplementationPlatform::CreateWifiDirectMedium() !=
-        nullptr;
-  } catch (...) {
-    wifi_direct_ = false;
-  }
-  service_ = nearby::sharing::NearbySharingServiceFactory::GetInstance()
-                 ->CreateSharingService(*platform_, &analytics_recorder_,
-                                        /*event_logger=*/nullptr,
-                                        /*supports_file_sync=*/false);
-  if (service_ == nullptr) {
+  qs_ = quickshare_create();
+  if (qs_ == nullptr) {
     qCritical() << "Failed to create NearbySharingService";
     desired_mode_ = Mode::kNone;
     return;
   }
+  wifi_direct_ = quickshare_wifi_direct_available(qs_) != 0;
+  ConnectLibrary();
 
   issues_timer_.setInterval(kIssuesRefreshMilliseconds);
   connect(&issues_timer_, &QTimer::timeout, this, &Backend::RefreshIssues);
   issues_timer_.start();
   RefreshIssues();
 
-  service_->GetSettings()->SetDataUsage(
-      nearby::sharing::proto::WIFI_ONLY_DATA_USAGE);
-  QPointer<Backend> backend(this);
-  service_->SetVisibility(
-      nearby::sharing::proto::DEVICE_VISIBILITY_EVERYONE, absl::ZeroDuration(),
-      [backend](NearbySharingService::StatusCodes status) mutable {
-        if (!backend) {
+  quickshare_initialize(
+      qs_, StatusThunk,
+      PostedStatus(this, [](Backend& backend, int status) {
+        if (backend.shutting_down_) {
           return;
         }
-        PostStatus(backend, [backend, status]() {
-          if (!backend || backend->shutting_down_) {
-            return;
-          }
-          backend->initialized_ =
-              status == NearbySharingService::StatusCodes::kOk;
-          backend->ReportStatus(QStringLiteral("Initialize"), status);
-          if (backend->initialized_) {
-            backend->StartFastInitiationMonitoring();
-          } else {
-            backend->desired_mode_ = Mode::kNone;
-          }
-        });
-      });
+        backend.initialized_ = status == QUICKSHARE_OK;
+        backend.ReportStatus(QStringLiteral("Initialize"), status);
+        if (backend.initialized_) {
+          backend.StartFastInitiationMonitoring();
+        } else {
+          backend.desired_mode_ = Mode::kNone;
+        }
+      }));
 }
 
-Backend::Backend(NearbySharingService& service,
-                 nearby::api::FastInitiationManager& fast_init_manager,
-                 int receive_timeout_milliseconds, QObject* parent)
+Backend::Backend(QuickShare* qs, int receive_timeout_milliseconds,
+                 QObject* parent)
     : QObject(parent),
       targets_(this),
       transfers_(this),
-      fast_init_manager_(&fast_init_manager),
-      service_(&service),
-      send_transfer_callback_(*this, false),
-      receive_transfer_callback_(*this, true),
+      qs_(qs),
       initialized_(true) {
   receive_timeout_timer_.setSingleShot(true);
   receive_timeout_timer_.setInterval(receive_timeout_milliseconds);
   connect(&receive_timeout_timer_, &QTimer::timeout, this,
           &Backend::OnReceiveTimeout);
+  ConnectLibrary();
   StartFastInitiationMonitoring();
 }
 
 Backend::~Backend() {
   shutdown();
+  if (qs_ != nullptr) {
+    quickshare_destroy(qs_);
+    qs_ = nullptr;
+  }
+}
+
+void Backend::ConnectLibrary() {
+  const QuickShareCallbacks callbacks = {&Backend::TargetFound,
+                                         &Backend::TargetLost,
+                                         &Backend::TransferUpdate, this};
+  quickshare_set_callbacks(qs_, &callbacks);
 }
 
 QString Backend::hostname() const {
   return QSysInfo::machineHostName();
 }
 
+bool Backend::reduceMotion() const {
+  return qEnvironmentVariableIntValue("QUICKSHARE_REDUCE_MOTION") != 0;
+}
+
 void Backend::startReceive() {
-  if (service_ == nullptr || shutting_down_) {
+  if (qs_ == nullptr || shutting_down_) {
     return;
   }
   StartFastInitiationMonitoring();
 }
 
 void Backend::startDiscovery() {
-  if (service_ == nullptr || shutting_down_) {
+  if (qs_ == nullptr || shutting_down_) {
     return;
   }
   monitoring_requested_ = false;
@@ -524,7 +452,7 @@ void Backend::startDiscovery() {
 }
 
 bool Backend::sendFiles(qint64 share_target_id, const QStringList& paths) {
-  if (service_ == nullptr || shutting_down_ || paths.isEmpty()) {
+  if (qs_ == nullptr || shutting_down_ || paths.isEmpty()) {
     return false;
   }
   std::vector<std::string> native_paths;
@@ -548,23 +476,22 @@ bool Backend::sendFiles(qint64 share_target_id, const QStringList& paths) {
       share_target_id,
       paths.size() == 1 ? NormalizeLocalPath(paths.first()) : QString(),
       target);
-  QPointer<Backend> backend(this);
-  service_->SendAttachments(
-      share_target_id, CreateFileAttachments(native_paths),
-      [backend, share_target_id](NearbySharingService::StatusCodes status) {
-        if (!backend) {
+  std::vector<const char*> c_paths;
+  for (const std::string& path : native_paths) {
+    c_paths.push_back(path.c_str());
+  }
+  quickshare_send_files(
+      qs_, share_target_id, c_paths.data(), static_cast<int>(c_paths.size()),
+      StatusThunk,
+      PostedStatus(this, [share_target_id](Backend& backend, int status) {
+        if (backend.shutting_down_) {
           return;
         }
-        PostStatus(backend, [backend, share_target_id, status]() {
-          if (!backend || backend->shutting_down_) {
-            return;
-          }
-          backend->ReportStatus(QStringLiteral("Send files"), status);
-          if (status != NearbySharingService::StatusCodes::kOk) {
-            emit backend->outgoingTransferStartFailed(share_target_id);
-          }
-        });
-      });
+        backend.ReportStatus(QStringLiteral("Send files"), status);
+        if (status != QUICKSHARE_OK) {
+          emit backend.outgoingTransferStartFailed(share_target_id);
+        }
+      }));
   return true;
 }
 
@@ -586,9 +513,8 @@ void Backend::setReceiveEnabled(bool enabled) {
   receive_enabled_ = enabled;
   emit receiveEnabledChanged();
   RefreshIssues();
-  if (service_ == nullptr || shutting_down_ ||
-      active_mode_ == Mode::kDiscovery || desired_mode_ == Mode::kDiscovery ||
-      fast_init_scan_stop_in_flight_) {
+  if (qs_ == nullptr || shutting_down_ || active_mode_ == Mode::kDiscovery ||
+      desired_mode_ == Mode::kDiscovery || fast_init_scan_stop_in_flight_) {
     return;
   }
   if (!enabled && !incoming_offer_timers_.isEmpty()) {
@@ -598,30 +524,45 @@ void Backend::setReceiveEnabled(bool enabled) {
 }
 
 void Backend::accept(qint64 share_target_id) {
-  if (service_ != nullptr && !shutting_down_) {
+  if (qs_ != nullptr && !shutting_down_) {
     ResolveIncomingOffer(share_target_id);
-    service_->Accept(share_target_id,
-                     StatusCallback(QStringLiteral("Accept transfer")));
+    quickshare_accept(
+        qs_, share_target_id, StatusThunk,
+        PostedStatus(this, [](Backend& backend, int status) {
+          if (!backend.shutting_down_) {
+            backend.ReportStatus(QStringLiteral("Accept transfer"), status);
+          }
+        }));
   }
 }
 
 void Backend::reject(qint64 share_target_id) {
-  if (service_ != nullptr && !shutting_down_) {
+  if (qs_ != nullptr && !shutting_down_) {
     ResolveIncomingOffer(share_target_id);
-    service_->Reject(share_target_id,
-                     StatusCallback(QStringLiteral("Reject transfer")));
+    quickshare_reject(
+        qs_, share_target_id, StatusThunk,
+        PostedStatus(this, [](Backend& backend, int status) {
+          if (!backend.shutting_down_) {
+            backend.ReportStatus(QStringLiteral("Reject transfer"), status);
+          }
+        }));
   }
 }
 
 void Backend::cancel(qint64 share_target_id) {
-  if (service_ != nullptr && !shutting_down_) {
-    service_->Cancel(share_target_id,
-                     StatusCallback(QStringLiteral("Cancel transfer")));
+  if (qs_ != nullptr && !shutting_down_) {
+    quickshare_cancel(
+        qs_, share_target_id, StatusThunk,
+        PostedStatus(this, [](Backend& backend, int status) {
+          if (!backend.shutting_down_) {
+            backend.ReportStatus(QStringLiteral("Cancel transfer"), status);
+          }
+        }));
   }
 }
 
 void Backend::shutdown() {
-  if (service_ == nullptr || shutting_down_) {
+  if (qs_ == nullptr || shutting_down_) {
     return;
   }
   shutting_down_ = true;
@@ -633,23 +574,25 @@ void Backend::shutdown() {
   for (QTimer* timer : offer_timers) {
     timer->stop();
   }
-  auto& fast_init_manager = *fast_init_manager_;
-  if (fast_init_manager.IsScanning()) {
-    fast_init_manager.StopScanning(nullptr);
+  if (quickshare_fast_init_is_scanning(qs_)) {
+    quickshare_fast_init_stop_scanning(qs_, nullptr, nullptr);
   }
   desired_mode_ = Mode::kNone;
-  const auto status = ShutdownService(*service_);
-  if (status != NearbySharingService::StatusCodes::kOk) {
-    qWarning() << "Nearby Sharing shutdown failed:"
-               << NearbySharingService::StatusCodeToString(status);
+  const int status = quickshare_shutdown(qs_);
+  if (status != QUICKSHARE_OK) {
+    char description[128] = {};
+    quickshare_status_string(status, description, sizeof(description));
+    qWarning() << "Nearby Sharing shutdown failed:" << description;
   }
-  service_ = nullptr;
 }
 
-void Backend::OnShareTargetDiscovered(const ShareTarget& target) {
-  QPointer<Backend> backend(this);
-  PostStatus(this, [backend, target]() {
-    if (!backend || backend->shutting_down_) {
+// The library calls the static callbacks below on its own threads. Each one
+// copies its arguments into Qt types before queueing work for the GUI thread.
+void Backend::TargetFound(const QuickShareTarget* target_data, void* user) {
+  auto* backend = static_cast<Backend*>(user);
+  const ShareTarget target = ToTargetInfo(*target_data);
+  PostStatus(backend, [backend, target]() {
+    if (backend->shutting_down_) {
       return;
     }
     backend->targets_.ApplyTarget(target);
@@ -657,63 +600,63 @@ void Backend::OnShareTargetDiscovered(const ShareTarget& target) {
   });
 }
 
-void Backend::OnShareTargetUpdated(const ShareTarget& target) {
-  OnShareTargetDiscovered(target);
-}
-
-void Backend::OnShareTargetLost(const ShareTarget& target) {
-  QPointer<Backend> backend(this);
-  PostStatus(this, [backend, id = target.id]() {
-    if (backend && !backend->shutting_down_) {
+void Backend::TargetLost(const QuickShareTarget* target_data, void* user) {
+  auto* backend = static_cast<Backend*>(user);
+  const int64_t id = target_data->id;
+  PostStatus(backend, [backend, id]() {
+    if (!backend->shutting_down_) {
       backend->targets_.RemoveTarget(id);
     }
   });
 }
 
-void Backend::OnTransferUpdate(
-    bool receive_mode, const ShareTarget& target,
-    const nearby::sharing::AttachmentContainer& attachments,
-    const TransferMetadata& transfer) {
-  const int64_t total_bytes = attachments.GetTotalAttachmentsSize();
-  const int attachment_count = attachments.GetAttachmentCount();
-  QPointer<Backend> backend(this);
-  PostStatus(this, [backend, receive_mode, target, transfer, total_bytes,
-                    attachment_count]() {
-    if (!backend || backend->shutting_down_) {
-      return;
-    }
-    backend->targets_.ApplyTarget(target);
-    backend->transfers_.ApplyTransfer(receive_mode, target, transfer,
-                                      total_bytes);
-    if (!transfer.is_final_status()) {
-      backend->finished_transfer_ids_.remove(target.id);
-    }
-    if (receive_mode &&
-        transfer.status() ==
-            TransferMetadata::Status::kAwaitingLocalConfirmation) {
-      backend->receive_offer_received_ = true;
-      backend->receive_timeout_timer_.stop();
-      backend->StartIncomingOfferTimer(target.id);
-      emit backend->incomingTransfer(target.id);
-      emit backend->incomingOffer(target.id, ToQString(target.device_name),
-                                  attachment_count, total_bytes);
-      return;
-    }
-
-    if (receive_mode) {
-      backend->ResolveIncomingOffer(target.id);
-    }
-    if (transfer.is_final_status() &&
-        !backend->finished_transfer_ids_.contains(target.id)) {
-      backend->finished_transfer_ids_.insert(target.id);
-      emit backend->transferFinished(
-          target.id, receive_mode, ToQString(target.device_name),
-          ToQString(TransferMetadata::StatusToString(transfer.status())));
-      if (receive_mode) {
-        backend->StartFastInitiationMonitoring();
-      }
+void Backend::TransferUpdate(const QuickShareTransfer* transfer_data,
+                             void* user) {
+  auto* backend = static_cast<Backend*>(user);
+  const bool receive_mode = transfer_data->receive_mode != 0;
+  const ShareTarget target = ToTargetInfo(transfer_data->target);
+  const TransferMetadata transfer = ToTransferInfo(*transfer_data);
+  const int64_t total_bytes = transfer_data->total_bytes;
+  const int attachment_count = transfer_data->attachment_count;
+  PostStatus(backend, [backend, receive_mode, target, transfer, total_bytes,
+                       attachment_count]() {
+    if (!backend->shutting_down_) {
+      backend->OnTransferUpdate(receive_mode, target, transfer, total_bytes,
+                                attachment_count);
     }
   });
+}
+
+void Backend::OnTransferUpdate(bool receive_mode, const ShareTarget& target,
+                               const TransferMetadata& transfer,
+                               int64_t total_bytes, int attachment_count) {
+  targets_.ApplyTarget(target);
+  transfers_.ApplyTransfer(receive_mode, target, transfer, total_bytes);
+  if (!transfer.is_final_status) {
+    finished_transfer_ids_.remove(target.id);
+  }
+  if (receive_mode &&
+      transfer.status == QUICKSHARE_TRANSFER_AWAITING_LOCAL_CONFIRMATION) {
+    receive_offer_received_ = true;
+    receive_timeout_timer_.stop();
+    StartIncomingOfferTimer(target.id);
+    emit incomingTransfer(target.id);
+    emit incomingOffer(target.id, target.device_name, attachment_count,
+                       total_bytes);
+    return;
+  }
+
+  if (receive_mode) {
+    ResolveIncomingOffer(target.id);
+  }
+  if (transfer.is_final_status && !finished_transfer_ids_.contains(target.id)) {
+    finished_transfer_ids_.insert(target.id);
+    emit transferFinished(target.id, receive_mode, target.device_name,
+                          transfer.status_name);
+    if (receive_mode) {
+      StartFastInitiationMonitoring();
+    }
+  }
 }
 
 void Backend::StartIncomingOfferTimer(qint64 share_target_id) {
@@ -743,9 +686,15 @@ void Backend::OnIncomingOfferTimeout(qint64 share_target_id) {
     return;
   }
   ResolveIncomingOffer(share_target_id);
-  if (service_ != nullptr && !shutting_down_) {
-    service_->Reject(share_target_id,
-                     StatusCallback(QStringLiteral("Expire incoming offer")));
+  if (qs_ != nullptr && !shutting_down_) {
+    quickshare_reject(
+        qs_, share_target_id, StatusThunk,
+        PostedStatus(this, [](Backend& backend, int status) {
+          if (!backend.shutting_down_) {
+            backend.ReportStatus(QStringLiteral("Expire incoming offer"),
+                                 status);
+          }
+        }));
   }
 }
 
@@ -755,88 +704,56 @@ void Backend::SetDesiredMode(Mode mode) {
 }
 
 void Backend::DriveMode() {
-  if (!initialized_ || service_ == nullptr || shutting_down_ ||
+  if (!initialized_ || qs_ == nullptr || shutting_down_ ||
       mode_operation_in_flight_ || active_mode_ == desired_mode_) {
     return;
   }
 
   mode_operation_in_flight_ = true;
-  QPointer<Backend> backend(this);
   if (active_mode_ == Mode::kReceive) {
-    service_->UnregisterReceiveSurface(
-        &receive_transfer_callback_,
-        [backend](NearbySharingService::StatusCodes status) mutable {
-          if (backend) {
-            PostStatus(backend, [backend, status]() {
-              if (backend) {
-                backend->OnModeStopped(Mode::kReceive, status);
-              }
-            });
-          }
-        });
+    quickshare_unregister_receive_surface(
+        qs_, StatusThunk,
+        PostedStatus(this, [](Backend& backend, int status) {
+          backend.OnModeStopped(Mode::kReceive, status);
+        }));
     return;
   }
   if (active_mode_ == Mode::kDiscovery) {
-    service_->UnregisterSendSurface(
-        &send_transfer_callback_,
-        [backend](NearbySharingService::StatusCodes status) mutable {
-          if (backend) {
-            PostStatus(backend, [backend, status]() {
-              if (backend) {
-                backend->OnModeStopped(Mode::kDiscovery, status);
-              }
-            });
-          }
-        });
+    quickshare_unregister_send_surface(
+        qs_, StatusThunk,
+        PostedStatus(this, [](Backend& backend, int status) {
+          backend.OnModeStopped(Mode::kDiscovery, status);
+        }));
     return;
   }
 
   const Mode mode = desired_mode_;
   if (mode == Mode::kReceive) {
-    service_->RegisterReceiveSurface(
-        &receive_transfer_callback_,
-        NearbySharingService::ReceiveSurfaceState::kForeground,
-        nearby::sharing::Advertisement::BlockedVendorId::kNone,
-        [backend, mode](NearbySharingService::StatusCodes status) mutable {
-          if (backend) {
-            PostStatus(backend, [backend, mode, status]() {
-              if (backend) {
-                backend->OnModeStarted(mode, status);
-              }
-            });
-          }
-        });
+    quickshare_register_receive_surface(
+        qs_, StatusThunk,
+        PostedStatus(this, [mode](Backend& backend, int status) {
+          backend.OnModeStarted(mode, status);
+        }));
     return;
   }
   if (mode == Mode::kDiscovery) {
-    service_->RegisterSendSurface(
-        &send_transfer_callback_, this,
-        NearbySharingService::SendSurfaceState::kForeground,
-        nearby::sharing::Advertisement::BlockedVendorId::kNone,
-        /*disable_wifi_hotspot=*/false,
-        [backend, mode](NearbySharingService::StatusCodes status) mutable {
-          if (backend) {
-            PostStatus(backend, [backend, mode, status]() {
-              if (backend) {
-                backend->OnModeStarted(mode, status);
-              }
-            });
-          }
-        });
+    quickshare_register_send_surface(
+        qs_, StatusThunk,
+        PostedStatus(this, [mode](Backend& backend, int status) {
+          backend.OnModeStarted(mode, status);
+        }));
     return;
   }
 
   mode_operation_in_flight_ = false;
 }
 
-void Backend::OnModeStopped(Mode mode,
-                            NearbySharingService::StatusCodes status) {
+void Backend::OnModeStopped(Mode mode, int status) {
   mode_operation_in_flight_ = false;
   if (shutting_down_) {
     return;
   }
-  if (status == NearbySharingService::StatusCodes::kOk ||
-      status == NearbySharingService::StatusCodes::kStatusAlreadyStopped) {
+  if (status == QUICKSHARE_OK || status == QUICKSHARE_ALREADY_STOPPED) {
     active_mode_ = Mode::kNone;
     if (mode == Mode::kDiscovery) {
       targets_.Clear();
@@ -849,13 +766,12 @@ void Backend::OnModeStopped(Mode mode,
   MaybeStartFastInitiationScanning();
 }
 
-void Backend::OnModeStarted(Mode mode,
-                            NearbySharingService::StatusCodes status) {
+void Backend::OnModeStarted(Mode mode, int status) {
   mode_operation_in_flight_ = false;
   if (shutting_down_) {
     return;
   }
-  if (status == NearbySharingService::StatusCodes::kOk) {
+  if (status == QUICKSHARE_OK) {
     active_mode_ = mode;
     if (mode == Mode::kReceive && receive_window_pending_) {
       receive_window_pending_ = false;
@@ -887,7 +803,7 @@ void Backend::StartFastInitiationMonitoring() {
 }
 
 void Backend::MaybeStartFastInitiationScanning() {
-  if (!initialized_ || service_ == nullptr || shutting_down_ ||
+  if (!initialized_ || qs_ == nullptr || shutting_down_ ||
       !monitoring_requested_ || fast_init_scan_stop_in_flight_ ||
       mode_operation_in_flight_ || active_mode_ != Mode::kNone ||
       desired_mode_ != Mode::kNone) {
@@ -899,47 +815,48 @@ void Backend::MaybeStartFastInitiationScanning() {
     return;
   }
 
-  auto& fast_init_manager = *fast_init_manager_;
-  if (fast_init_manager.IsScanning()) {
+  if (quickshare_fast_init_is_scanning(qs_)) {
     return;
   }
 
   sender_present_ = false;
   receive_trigger_armed_ = true;
-  QPointer<Backend> backend(this);
-  fast_init_manager.StartScanning(
-      [backend]() {
-        if (backend) {
-          PostStatus(backend, [backend]() {
-            if (backend) {
-              backend->OnFastInitiationDevicesDiscovered();
-            }
-          });
-        }
-      },
-      [backend]() {
-        if (backend) {
-          PostStatus(backend, [backend]() {
-            if (backend) {
-              backend->OnFastInitiationDevicesNotDiscovered();
-            }
-          });
-        }
-      },
-      [backend](nearby::api::FastInitiationManager::Error error) {
-        if (backend) {
-          PostStatus(backend, [backend, error]() {
-            if (backend) {
-              backend->OnFastInitiationScanningError(error);
-            }
-          });
-        }
-      });
+  const QuickShareFastInitCallbacks callbacks = {
+      &Backend::FastInitDevicesDiscovered,
+      &Backend::FastInitDevicesNotDiscovered, &Backend::FastInitError, this};
+  quickshare_fast_init_start_scanning(qs_, &callbacks);
+}
+
+void Backend::FastInitDevicesDiscovered(void* user) {
+  auto* backend = static_cast<Backend*>(user);
+  PostStatus(backend, [backend]() {
+    backend->OnFastInitiationDevicesDiscovered();
+  });
+}
+
+void Backend::FastInitDevicesNotDiscovered(void* user) {
+  auto* backend = static_cast<Backend*>(user);
+  PostStatus(backend, [backend]() {
+    backend->OnFastInitiationDevicesNotDiscovered();
+  });
+}
+
+void Backend::FastInitError(int error, void* user) {
+  auto* backend = static_cast<Backend*>(user);
+  PostStatus(backend, [backend, error]() {
+    backend->OnFastInitiationScanningError(error);
+  });
+}
+
+void Backend::FastInitScanningStopped(void* user) {
+  auto* backend = static_cast<Backend*>(user);
+  PostStatus(backend, [backend]() {
+    backend->OnFastInitiationScanningStoppedForDiscovery();
+  });
 }
 
 void Backend::StopFastInitiationScanningForDiscovery() {
-  auto& fast_init_manager = *fast_init_manager_;
-  if (!fast_init_manager.IsScanning()) {
+  if (!quickshare_fast_init_is_scanning(qs_)) {
     SetDesiredMode(Mode::kDiscovery);
     return;
   }
@@ -948,16 +865,8 @@ void Backend::StopFastInitiationScanningForDiscovery() {
   }
 
   fast_init_scan_stop_in_flight_ = true;
-  QPointer<Backend> backend(this);
-  fast_init_manager.StopScanning([backend]() {
-    if (backend) {
-      PostStatus(backend, [backend]() {
-        if (backend) {
-          backend->OnFastInitiationScanningStoppedForDiscovery();
-        }
-      });
-    }
-  });
+  quickshare_fast_init_stop_scanning(qs_, &Backend::FastInitScanningStopped,
+                                     this);
 }
 
 void Backend::OnFastInitiationScanningStoppedForDiscovery() {
@@ -993,13 +902,11 @@ void Backend::OnFastInitiationDevicesNotDiscovered() {
   receive_trigger_armed_ = true;
 }
 
-void Backend::OnFastInitiationScanningError(
-    nearby::api::FastInitiationManager::Error error) {
+void Backend::OnFastInitiationScanningError(int error) {
   if (shutting_down_ || !monitoring_requested_) {
     return;
   }
-  qWarning() << "Fast Initiation scanning failed with error"
-             << static_cast<int>(error);
+  qWarning() << "Fast Initiation scanning failed with error" << error;
   if (fallback_receive_used_) {
     monitoring_requested_ = false;
     return;
@@ -1036,27 +943,12 @@ void Backend::OnReceiveTimeout() {
   SetDesiredMode(Mode::kNone);
 }
 
-std::function<void(NearbySharingService::StatusCodes)> Backend::StatusCallback(
-    QString operation) {
-  QPointer<Backend> backend(this);
-  return [backend, operation = std::move(operation)](
-             NearbySharingService::StatusCodes status) {
-    if (backend) {
-      PostStatus(backend, [backend, operation, status]() {
-        if (backend && !backend->shutting_down_) {
-          backend->ReportStatus(operation, status);
-        }
-      });
-    }
-  };
-}
-
-void Backend::ReportStatus(const QString& operation,
-                           NearbySharingService::StatusCodes status) {
-  if (status != NearbySharingService::StatusCodes::kOk) {
-    qWarning().noquote()
-        << operation + QStringLiteral(" failed: ") +
-               ToQString(NearbySharingService::StatusCodeToString(status));
+void Backend::ReportStatus(const QString& operation, int status) {
+  if (status != QUICKSHARE_OK) {
+    char description[128] = {};
+    quickshare_status_string(status, description, sizeof(description));
+    qWarning().noquote() << operation + QStringLiteral(" failed: ") +
+                                QString::fromUtf8(description);
   }
 }
 
@@ -1070,19 +962,19 @@ void Backend::RefreshIssues() {
 
 QVariantList Backend::BuildIssues() const {
   QVariantList issues;
-  if (service_ == nullptr || shutting_down_) {
+  if (qs_ == nullptr || shutting_down_) {
     return issues;
   }
-  if (!service_->IsBluetoothPowered()) {
+  if (!quickshare_is_bluetooth_powered(qs_)) {
     issues.push_back(CreateIssue(
         QStringLiteral("bluetooth"), QStringLiteral("error"),
         QStringLiteral("Bluetooth is off"),
         QStringLiteral(
             "Turn Bluetooth on so nearby devices can find this PC.")));
   }
-  if (active_mode_ == Mode::kReceive && nearby_linux_ble_advertising_ok() == 0) {
+  if (active_mode_ == Mode::kReceive && quickshare_ble_advertising_ok(qs_) == 0) {
     char error[256] = {};
-    nearby_linux_copy_ble_advertising_error(error, sizeof(error));
+    quickshare_copy_ble_advertising_error(qs_, error, sizeof(error));
     issues.push_back(CreateIssue(
         QStringLiteral("advertising"), QStringLiteral("error"),
         QStringLiteral("Phones can't find this PC"),
@@ -1090,7 +982,7 @@ QVariantList Backend::BuildIssues() const {
                        "Bluetooth service and try again.")
             .arg(QString::fromUtf8(error))));
   }
-  if (nearby_linux_pairing_prompt_count() > 0) {
+  if (quickshare_pairing_prompt_count(qs_) > 0) {
     issues.push_back(CreateIssue(
         QStringLiteral("pairing"), QStringLiteral("warning"),
         QStringLiteral("Bluetooth pairing request"),
@@ -1098,7 +990,7 @@ QVariantList Backend::BuildIssues() const {
             "BlueZ is asking to pair with a device. Confirm the prompt on "
             "this PC and on the phone to continue.")));
   }
-  if (!wifi_direct_ && !service_->IsLanConnected()) {
+  if (!wifi_direct_ && !quickshare_is_lan_connected(qs_)) {
     issues.push_back(CreateIssue(
         QStringLiteral("slow"), QStringLiteral("info"),
         QStringLiteral("Large files will be slow"),

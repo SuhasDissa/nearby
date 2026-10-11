@@ -17,9 +17,9 @@
 
 namespace {
 
-constexpr char kApplicationService[] = "com.google.quickshare";
-constexpr char kApplicationPath[] = "/com/google/quickshare";
-constexpr char kApplicationInterface[] = "com.google.quickshare";
+constexpr char kApplicationService[] = "io.github.quickshare_linux.QuickShare";
+constexpr char kApplicationPath[] = "/io/github/quickshare_linux/QuickShare";
+constexpr char kApplicationInterface[] = "io.github.quickshare_linux.QuickShare";
 constexpr char kNotificationService[] = "org.freedesktop.Notifications";
 constexpr char kNotificationPath[] = "/org/freedesktop/Notifications";
 constexpr char kNotificationInterface[] = "org.freedesktop.Notifications";

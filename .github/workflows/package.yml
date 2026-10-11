@@ -1,0 +1,310 @@
+name: Package
+
+# The one place every package build is defined. Both callers - build.yml (manual, unversioned)
+# and release.yml (tag-triggered, publishes) - reuse this so a fix to a build never has to be
+# applied twice.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Version string baked into artifact names"
+        required: true
+        type: string
+      platforms:
+        description: "all, flatpak, appimage or arch"
+        required: false
+        default: all
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  # Latest 6.10.x patch aqt knows about. The Qt Quick app requires >= 6.10 (see
+  # sharing/linux/app/CMakeLists.txt); the Flatpak tracks the same minor through org.kde.Platform
+  # 6.10.
+  QT_VERSION: "6.10.*"
+  APP_ID: io.github.quickshare_linux.QuickShare
+  PACKAGING: sharing/linux/app/packaging
+
+jobs:
+  flatpak:
+    name: Flatpak bundle
+    runs-on: ubuntu-24.04
+    if: inputs.platforms == 'all' || inputs.platforms == 'flatpak'
+    # Bazel compiles the whole Nearby tree inside flatpak-builder with no build cache.
+    timeout-minutes: 240
+    steps:
+      # The manifest builds the working tree, and Nearby's third_party dependencies are submodules.
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install flatpak tooling
+        timeout-minutes: 10
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          # Runner image adds packages.microsoft.com; azure-cli.list is the one *microsoft* misses.
+          # GitHub's apt-mirrors.txt tries azure.archive then archive.ubuntu.com; both stall.
+          sudo rm -f /etc/apt/sources.list.d/*microsoft* /etc/apt/sources.list.d/*azure-cli*
+          printf '%s\n' 'Acquire::http::Timeout "10";' 'Acquire::https::Timeout "10";' \
+            'Acquire::Retries "2";' 'APT::Acquire::Retries "2";' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          {
+            curl -fsSL --max-time 8 http://mirrors.ubuntu.com/mirrors.txt || true
+            echo "http://us.archive.ubuntu.com/ubuntu/"
+            echo "http://security.ubuntu.com/ubuntu/"
+          } | sed 's:/*$:/:' \
+            | grep -vi 'azure.archive.ubuntu.com' \
+            | grep -viE '^https?://archive\.ubuntu\.com/' \
+            | awk 'NF && !seen[$0]++' \
+            | awk '{ printf "%s\tpriority:%d\n", $0, NR }' \
+            | sudo tee /etc/apt/apt-mirrors.txt
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y -o Acquire::Retries=3 flatpak flatpak-builder appstream desktop-file-utils
+          flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo
+
+      - name: Lint flatpak manifest and metadata
+        run: |
+          appstreamcli validate --no-net "${PACKAGING}/${APP_ID}.metainfo.xml"
+          desktop-file-validate "${PACKAGING}/${APP_ID}.desktop"
+          flatpak-builder --show-manifest "${PACKAGING}/flatpak/${APP_ID}.yml" > /dev/null
+
+      - name: Cache flatpak runtimes
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/flatpak
+          key: flatpak-runtimes-${{ hashFiles('sharing/linux/app/packaging/flatpak/io.github.quickshare_linux.QuickShare.yml') }}
+
+      - name: Build flatpak
+        run: |
+          flatpak-builder --user --force-clean --install-deps-from=flathub \
+            --repo="${{ runner.temp }}/flatpak-repo" \
+            "${{ runner.temp }}/flatpak-build" \
+            "${PACKAGING}/flatpak/${APP_ID}.yml"
+
+      - name: Export bundle
+        run: |
+          mkdir -p dist
+          flatpak build-bundle "${{ runner.temp }}/flatpak-repo" \
+            "dist/QuickShare-${{ inputs.version }}.flatpak" \
+            "${APP_ID}"
+
+      - name: Upload flatpak bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-bundle
+          path: dist/*.flatpak
+
+  appimage:
+    name: Linux AppImage
+    # 24.04, not 22.04: the same image tests.yml proves the Bazel build on. Nothing here has
+    # been shown to compile against jammy's gcc 11 libstdc++ (C++20 is required), and the system
+    # libraries MODULE.bazel links (libsystemd, libcurl, libbluetooth) are only verified on noble.
+    # The price is the glibc floor: the AppImage will not start on a host older than glibc 2.39
+    # (Ubuntu 24.04, Debian 13, Fedora 40, current Arch).
+    runs-on: ubuntu-24.04
+    if: inputs.platforms == 'all' || inputs.platforms == 'appimage'
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set up Bazelisk
+        uses: bazel-contrib/setup-bazel@0.18.0
+        with:
+          # Avoid downloading Bazel every time.
+          bazelisk-cache: true
+          # Store build cache per job: the callers have different workflow names, and a shared
+          # key lets a release build reuse what a manual dry run compiled.
+          disk-cache: appimage
+          # Share repository cache between workflows.
+          repository-cache: true
+
+      # cmake is deliberately not installed from apt: the runner image already carries a newer one
+      # on PATH. libssl-dev/libcurl4-openssl-dev/libsystemd-dev/libbluetooth-dev are what
+      # libquickshare.so links (MODULE.bazel and internal/platform/implementation/linux/BUILD);
+      # the rest is what Qt's own CMake config and linuxdeploy's xcb plugin resolution need.
+      - name: Install native build dependencies
+        timeout-minutes: 10
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          # Runner image adds packages.microsoft.com; azure-cli.list is the one *microsoft* misses.
+          # GitHub's apt-mirrors.txt tries azure.archive then archive.ubuntu.com; both stall.
+          sudo rm -f /etc/apt/sources.list.d/*microsoft* /etc/apt/sources.list.d/*azure-cli*
+          printf '%s\n' 'Acquire::http::Timeout "10";' 'Acquire::https::Timeout "10";' \
+            'Acquire::Retries "2";' 'APT::Acquire::Retries "2";' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-timeouts >/dev/null
+          {
+            curl -fsSL --max-time 8 http://mirrors.ubuntu.com/mirrors.txt || true
+            echo "http://us.archive.ubuntu.com/ubuntu/"
+            echo "http://security.ubuntu.com/ubuntu/"
+          } | sed 's:/*$:/:' \
+            | grep -vi 'azure.archive.ubuntu.com' \
+            | grep -viE '^https?://archive\.ubuntu\.com/' \
+            | awk 'NF && !seen[$0]++' \
+            | awk '{ printf "%s\tpriority:%d\n", $0, NR }' \
+            | sudo tee /etc/apt/apt-mirrors.txt
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y -o Acquire::Retries=3 ca-certificates gnupg wget
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | gpg --dearmor \
+            | sudo tee /usr/share/keyrings/apt.llvm.org.gpg >/dev/null
+          echo "deb [signed-by=/usr/share/keyrings/apt.llvm.org.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-21.list
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y -o Acquire::Retries=3 \
+            build-essential ninja-build pkg-config git patchelf \
+            clang-21 \
+            libssl-dev libcurl4-openssl-dev libsystemd-dev libbluetooth-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libfontconfig1-dev libfreetype6-dev libglib2.0-dev libdbus-1-dev \
+            libwayland-dev \
+            libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev libxi-dev libxrender-dev \
+            libxcb1-dev libxcb-glx0-dev libxcb-keysyms1-dev libxcb-image0-dev libxcb-shm0-dev \
+            libxcb-icccm4-dev libxcb-sync-dev libxcb-xfixes0-dev libxcb-shape0-dev \
+            libxcb-randr0-dev libxcb-render-util0-dev libxcb-xinerama0-dev libxcb-cursor-dev
+          # The runner image already ships an older clang as /usr/bin/clang, so point Bazel at
+          # clang-21 through the user.bazelrc that .bazelrc try-imports.
+          printf '%s\n' \
+            'build --action_env=CC=clang-21 --action_env=CXX=clang++-21' \
+            'build --repo_env=CC=clang-21 --repo_env=CXX=clang++-21' > user.bazelrc
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          cache: true
+          add-tools-to-path: true
+
+      # The Nearby side is built by Bazel first; CMake then imports the resulting .so. The flags
+      # are the ones tests.yml builds with.
+      - name: Build libquickshare
+        run: |
+          bazel build \
+            --@com_google_protobuf//bazel/toolchains:prefer_prebuilt_protoc=true \
+            --copt='-DGITHUB_BUILD' \
+            //sharing/linux/lib:quickshare
+
+      - name: Configure
+        run: |
+          cmake -S sharing/linux/app -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${QT_ROOT_DIR}" \
+            -DQUICKSHARE_LIB_DIR="${GITHUB_WORKSPACE}/bazel-bin/sharing/linux/lib"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      # The binary's RPATH is $ORIGIN/../lib and libquickshare.so installs to lib/, so the staged
+      # tree is already self-contained for linuxdeploy to follow.
+      - name: Stage install tree
+        run: |
+          cmake --install build --prefix "${GITHUB_WORKSPACE}/AppDir/usr"
+          mkdir -p "${GITHUB_WORKSPACE}/dist"
+
+      - name: Build AppImage
+        shell: bash
+        run: |
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage -O linuxdeploy.AppImage
+          wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage -O linuxdeploy-plugin-qt.AppImage
+          chmod +x linuxdeploy.AppImage linuxdeploy-plugin-qt.AppImage
+          # 24.04 runners ship no libfuse2, which AppImages need to mount themselves. Extract-and-run
+          # is inherited by the plugins linuxdeploy spawns, including appimagetool.
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          export QMAKE="${QT_ROOT_DIR}/bin/qmake"
+          export VERSION="${{ inputs.version }}"
+          export LDAI_OUTPUT="QuickShare-${{ inputs.version }}-x86_64.AppImage"
+          # The app's QML is compiled into the binary, but the Qt Quick modules it imports are
+          # not: without QML_SOURCES_PATHS the qt plugin has nothing to scan and ships an AppImage
+          # whose every import fails at startup.
+          export QML_SOURCES_PATHS="${GITHUB_WORKSPACE}/sharing/linux/app"
+          export LD_LIBRARY_PATH="${QT_ROOT_DIR}/lib:${LD_LIBRARY_PATH:-}"
+          # xcb is deployed by default; the Wayland client plugin is not.
+          export EXTRA_PLATFORM_PLUGINS="libqwayland.so"
+          # waylandcompositor is the only module whose deployer ships
+          # wayland-graphics-integration-client. Without its EGL plugin QtWayland has no client
+          # buffer integration, so no OpenGL context can be created on Wayland at all.
+          # The plugin splits this list on ';' - a space-separated list matches nothing and
+          # silently deploys no extra modules.
+          export EXTRA_QT_MODULES="waylandcompositor"
+          # The -l lines are libraries linuxdeploy sees no NEEDED entry to follow: OpenSSL is
+          # Qt's ossl TLS backend (dlopened by soname), and libquickshare.so is named explicitly
+          # so a change to the RPATH cannot silently drop it.
+          ./linuxdeploy.AppImage --appdir AppDir --plugin qt --output appimage \
+            -d "${PACKAGING}/${APP_ID}.desktop" \
+            -i "AppDir/usr/share/icons/hicolor/scalable/apps/${APP_ID}.svg" \
+            -e AppDir/usr/bin/quickshare \
+            -l AppDir/usr/lib/libquickshare.so \
+            -l /usr/lib/x86_64-linux-gnu/libssl.so.3 \
+            -l /usr/lib/x86_64-linux-gnu/libcrypto.so.3
+          mv "${LDAI_OUTPUT}" dist/
+
+      # sharing/linux/app/main.cc forces QT_QPA_PLATFORMTHEME=xdgdesktopportal inside an
+      # AppImage, so that plugin must be in the bundle or file dialogs fall back to Qt's own.
+      # Both platform plugins and the Nearby library are checked for the same reason: a missing
+      # one only shows up on a user's machine.
+      - name: Verify AppImage contents
+        working-directory: dist
+        run: |
+          chmod +x ./*.AppImage
+          APPIMAGE_EXTRACT_AND_RUN=1 ./*.AppImage --appimage-extract > /dev/null
+          for f in libquickshare.so libqxcb.so libqwayland.so libqxdgdesktopportal.so; do
+            if ! find squashfs-root -name "$f" | grep -q .; then
+              echo "::error::$f is missing from the AppImage"
+              exit 1
+            fi
+          done
+          rm -rf squashfs-root
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: dist/*.AppImage
+
+  arch:
+    name: Arch package
+    runs-on: ubuntu-24.04
+    if: inputs.platforms == 'all' || inputs.platforms == 'arch'
+    timeout-minutes: 120
+    container:
+      image: archlinux:base-devel
+    steps:
+      # git first, so checkout does a real clone instead of the REST tarball fallback.
+      - name: Install git
+        run: pacman -Syu --noconfirm git
+
+      - uses: actions/checkout@v6
+
+      # makepkg refuses to run as root, and archlinux:base-devel's default
+      # user is root - create an unprivileged builder with passwordless sudo
+      # (needed for makepkg -s to pacman-install PKGBUILD's own depends).
+      - name: Set up builder user
+        run: |
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          chown -R builder:builder "${GITHUB_WORKSPACE}"
+
+      # The PKGBUILD's source is git+https with a #commit= ref that defaults to the linux
+      # branch (there is no tagged release to pin yet), but it reads _commit from the
+      # environment first, so pin it to the exact commit that triggered this workflow.
+      - name: Build package
+        run: su builder -c "cd '${GITHUB_WORKSPACE}/sharing/linux/app/packaging/arch' && _commit='${{ github.sha }}' makepkg -s --noconfirm"
+
+      - name: Collect package
+        run: |
+          mkdir -p dist
+          cp sharing/linux/app/packaging/arch/*.pkg.tar.zst dist/
+
+      - name: Upload Arch package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: arch-package
+          path: dist/*.pkg.tar.zst

@@ -1,0 +1,71 @@
+# Maintainer: Suhas Dissanayake <suhasdissa@gmail.com>
+pkgname=quickshare-linux
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Quick Share client for Linux: share files with nearby Android devices over Bluetooth and Wi-Fi"
+arch=('x86_64')
+url="https://github.com/SuhasDissa/nearby"
+license=('Apache-2.0')
+options=('!debug')
+# bluez-libs, systemd-libs and curl are what libquickshare.so links against (checked with ldd);
+# openssl comes in through curl. qt6-svg supplies the SVG image-format and icon-engine plugins:
+# every icon in the UI is an .svg and nothing links against them, so it is a runtime dependency
+# only. qt6-wayland is the Wayland platform plugin.
+depends=(
+    'qt6-base' 'qt6-declarative' 'qt6-svg' 'qt6-wayland'
+    'bluez-libs' 'systemd-libs' 'curl' 'openssl'
+)
+# Talked to over D-Bus at runtime, none of them is linked.
+optdepends=(
+    'bluez: Bluetooth discovery and transfers'
+    'networkmanager: Wi-Fi Direct and hotspot connections'
+    'avahi: mDNS discovery on the local network'
+    'xdg-desktop-portal: native file picker'
+)
+# bazelisk fetches the Bazel version pinned in .bazelversion; Bazel itself downloads the rest of
+# its toolchain (Rust, prebuilt protoc) and module dependencies. cmake and ninja are for both the
+# Qt app and sdbus-c++, which Bazel builds from source through rules_foreign_cc. libsystemd
+# headers and the pkg-config files come from systemd-libs. gtest avoids a FetchContent download.
+makedepends=('bazelisk' 'clang' 'cmake' 'ninja' 'git' 'pkgconf' 'gtest')
+# makepkg's #commit= accepts any ref git can check out, not only a hash. There is no tagged
+# release yet, so the default tracks the linux branch; CI overrides _commit with $GITHUB_SHA to
+# build the exact commit that triggered the workflow. Switch the default to a tag once one exists.
+_commit="${_commit:-linux}"
+source=("$pkgname::git+https://github.com/SuhasDissa/nearby.git#commit=$_commit")
+sha256sums=('SKIP')
+
+prepare() {
+    cd "$pkgname"
+    git submodule update --init --recursive
+}
+
+build() {
+    cd "$pkgname"
+    # .bazelrc already pins CC/CXX to clang. The output root stays inside $srcdir so nothing is
+    # left in the builder's home. -DGITHUB_BUILD and the prebuilt protoc follow
+    # .github/workflows/validate.yaml. --max_idle_secs instead of `bazel shutdown`: in a container
+    # whose PID 1 does not reap orphans the server lingers as a zombie and shutdown fails the build.
+    bazelisk --output_user_root="$srcdir/bazel-root" --max_idle_secs=5 build \
+        --jobs="$(nproc)" \
+        --@com_google_protobuf//bazel/toolchains:prefer_prebuilt_protoc=true \
+        --copt=-DGITHUB_BUILD \
+        //sharing/linux/lib:quickshare
+
+    # The binary's RPATH is $ORIGIN/../lib, which is /usr/lib once installed under /usr/bin.
+    cmake -S sharing/linux/app -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DQUICKSHARE_LIB_DIR="$PWD/bazel-bin/sharing/linux/lib"
+    cmake --build build --parallel
+}
+
+check() {
+    cd "$pkgname"
+    ctest --test-dir build --output-on-failure
+}
+
+package() {
+    cd "$pkgname"
+    DESTDIR="$pkgdir" cmake --install build
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

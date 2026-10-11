@@ -1,0 +1,45 @@
+name: Build
+
+# Manual, unversioned dry run of the release builds. Use this to prove a package green before
+# pushing a tag - a tag is public the moment release.yml finishes, so a failure there is expensive.
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Which package(s) to build (pick one to test a single side first)"
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - flatpak
+          - appimage
+          - arch
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  meta:
+    name: Compute metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Compute version
+        id: meta
+        shell: bash
+        run: echo "version=0.0.0-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+  package:
+    name: Package
+    needs: meta
+    uses: ./.github/workflows/package.yml
+    with:
+      version: ${{ needs.meta.outputs.version }}
+      platforms: ${{ inputs.platforms }}
+    secrets: inherit

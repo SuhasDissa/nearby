@@ -20,3 +20,23 @@ After file logging initializes, native Abseil diagnostics are not duplicated
 to stderr. If the file cannot be initialized or written, diagnostics fall back
 to stderr. Qt and QML messages keep their existing behavior and are not written
 to these files.
+
+## Packaging
+
+Packages are built in CI by `.github/workflows/package.yml` (manual dry run: `build.yml`,
+tagged release: `release.yml`). Recipes live in `app/packaging/`. Locally:
+
+```sh
+# Plain build (Bazel for libquickshare.so, CMake for the Qt app)
+sharing/linux/build.sh
+
+# Flatpak (needs org.kde.Sdk//6.10 and the llvm20 SDK extension from Flathub)
+flatpak-builder --user --force-clean --install-deps-from=flathub \
+  --repo=/tmp/qs-repo /tmp/qs-build \
+  sharing/linux/app/packaging/flatpak/io.github.quickshare_linux.QuickShare.yml
+
+# Arch (builds the branch given by _commit, default: linux)
+cd sharing/linux/app/packaging/arch && makepkg -si
+
+# AppImage: CI only (Qt 6.10 from aqt + linuxdeploy; see the appimage job in package.yml)
+```

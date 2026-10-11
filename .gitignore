@@ -65,3 +65,4 @@ bazel-*
 # /.devcontainer/
 /connections/walkietalkie/
 /third_party/
+/user.bazelrc

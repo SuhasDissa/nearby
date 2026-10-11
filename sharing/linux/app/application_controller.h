@@ -16,7 +16,7 @@ class QSystemTrayIcon;
 
 class ApplicationController : public QObject {
   Q_OBJECT
-  Q_CLASSINFO("D-Bus Interface", "com.google.quickshare")
+  Q_CLASSINFO("D-Bus Interface", "io.github.quickshare_linux.QuickShare")
   Q_PROPERTY(bool closeToTray READ closeToTray NOTIFY closeToTrayChanged)
 
  public:

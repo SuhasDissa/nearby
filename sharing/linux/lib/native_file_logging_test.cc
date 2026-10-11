@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "sharing/linux/app/native_file_logging.h"
+#include "sharing/linux/lib/native_file_logging.h"
 
 #include <sys/stat.h>
 #include <unistd.h>

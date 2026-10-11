@@ -1,0 +1,6 @@
+{
+  global:
+    quickshare_*;
+  local:
+    *;
+};

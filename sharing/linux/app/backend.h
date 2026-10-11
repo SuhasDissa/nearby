@@ -1,10 +1,7 @@
 #pragma once
 
 #include <cstdint>
-#include <functional>
-#include <memory>
 #include <optional>
-#include <string>
 #include <vector>
 
 #include <QAbstractListModel>
@@ -19,22 +16,31 @@
 #include <QTimer>
 #include <QVariantList>
 
-#include "QtQmlIntegration/qqmlintegration.h"
-#include "qtmetamacros.h"
-#include "sharing/attachment_container.h"
-#include "sharing/linux/nearby_noop_analytics_recorder.h"
-#include "sharing/linux/platform/linux_sharing_platform.h"
-#include "sharing/nearby_sharing_service.h"
-#include "sharing/share_target.h"
-#include "sharing/share_target_discovered_callback.h"
-#include "sharing/transfer_metadata.h"
-#include "sharing/transfer_update_callback.h"
+#include <QtQmlIntegration/qqmlintegration.h>
+
+#include "quickshare.h"
+
+struct ShareTargetInfo {
+  int64_t id = 0;
+  QString device_name;
+  int type = 0;
+};
+
+struct TransferInfo {
+  int status = QUICKSHARE_TRANSFER_UNKNOWN;
+  QString status_name;
+  double progress_percent = 0;
+  quint64 transferred_bytes = 0;
+  int total_attachments_count = 0;
+  int transferred_attachments_count = 0;
+  bool is_final_status = false;
+};
 
 class ShareTargetModel : public QAbstractListModel {
   Q_OBJECT
 
  public:
-  using ShareTarget = nearby::sharing::ShareTarget;
+  using ShareTarget = ShareTargetInfo;
 
   enum Role {
     IdRole = Qt::UserRole + 1,
@@ -63,8 +69,8 @@ class ShareTransferModel : public QAbstractListModel {
   Q_OBJECT
 
  public:
-  using ShareTarget = nearby::sharing::ShareTarget;
-  using TransferMetadata = nearby::sharing::TransferMetadata;
+  using ShareTarget = ShareTargetInfo;
+  using TransferMetadata = TransferInfo;
 
   enum Role {
     IdRole = Qt::UserRole + 1,
@@ -115,11 +121,11 @@ class ShareTransferModel : public QAbstractListModel {
   QElapsedTimer clock_;
 };
 
-class Backend : public QObject,
-                public nearby::sharing::ShareTargetDiscoveredCallback {
+class Backend : public QObject {
   Q_OBJECT
   QML_ELEMENT
   Q_PROPERTY(QString hostname READ hostname CONSTANT)
+  Q_PROPERTY(bool reduceMotion READ reduceMotion CONSTANT)
   Q_PROPERTY(QAbstractListModel* targets READ targets CONSTANT)
   Q_PROPERTY(QAbstractListModel* transfers READ transfers CONSTANT)
   Q_PROPERTY(QVariantList issues READ issues NOTIFY issuesChanged)
@@ -131,6 +137,7 @@ class Backend : public QObject,
   ~Backend() override;
 
   QString hostname() const;
+  bool reduceMotion() const;
   QAbstractListModel* targets() { return &targets_; }
   QAbstractListModel* transfers() { return &transfers_; }
   QVariantList issues() const { return issues_; }
@@ -161,25 +168,8 @@ class Backend : public QObject,
  private:
   friend class BackendTestPeer;
 
-  using NearbySharingService = nearby::sharing::NearbySharingService;
-  using ShareTarget = nearby::sharing::ShareTarget;
-  using TransferMetadata = nearby::sharing::TransferMetadata;
-
-  class TransferCallback final
-      : public nearby::sharing::TransferUpdateCallback {
-   public:
-    TransferCallback(Backend& backend, bool receive_mode)
-        : backend_(backend), receive_mode_(receive_mode) {}
-
-    void OnTransferUpdate(
-        const ShareTarget& share_target,
-        const nearby::sharing::AttachmentContainer& attachment_container,
-        const TransferMetadata& transfer_metadata) override;
-
-   private:
-    Backend& backend_;
-    bool receive_mode_;
-  };
+  using ShareTarget = ShareTargetInfo;
+  using TransferMetadata = TransferInfo;
 
   enum class Mode {
     kNone,
@@ -187,49 +177,45 @@ class Backend : public QObject,
     kDiscovery,
   };
 
-  Backend(NearbySharingService& service,
-          nearby::api::FastInitiationManager& fast_init_manager,
-          int receive_timeout_milliseconds, QObject* parent);
+  // Takes ownership of qs.
+  Backend(QuickShare* qs, int receive_timeout_milliseconds, QObject* parent);
 
-  void OnShareTargetDiscovered(const ShareTarget& target) override;
-  void OnShareTargetUpdated(const ShareTarget& target) override;
-  void OnShareTargetLost(const ShareTarget& target) override;
+  void ConnectLibrary();
+  static void TargetFound(const QuickShareTarget* target, void* user);
+  static void TargetLost(const QuickShareTarget* target, void* user);
+  static void TransferUpdate(const QuickShareTransfer* transfer, void* user);
+  static void FastInitDevicesDiscovered(void* user);
+  static void FastInitDevicesNotDiscovered(void* user);
+  static void FastInitError(int error, void* user);
+  static void FastInitScanningStopped(void* user);
+
   void OnTransferUpdate(bool receive_mode, const ShareTarget& target,
-                        const nearby::sharing::AttachmentContainer& attachments,
-                        const TransferMetadata& transfer);
+                        const TransferMetadata& transfer, int64_t total_bytes,
+                        int attachment_count);
 
   void SetDesiredMode(Mode mode);
   void DriveMode();
-  void OnModeStopped(Mode mode, NearbySharingService::StatusCodes status);
-  void OnModeStarted(Mode mode, NearbySharingService::StatusCodes status);
+  void OnModeStopped(Mode mode, int status);
+  void OnModeStarted(Mode mode, int status);
   void StartFastInitiationMonitoring();
   void MaybeStartFastInitiationScanning();
   void StopFastInitiationScanningForDiscovery();
   void OnFastInitiationScanningStoppedForDiscovery();
   void OnFastInitiationDevicesDiscovered();
   void OnFastInitiationDevicesNotDiscovered();
-  void OnFastInitiationScanningError(
-      nearby::api::FastInitiationManager::Error error);
+  void OnFastInitiationScanningError(int error);
   void OpenReceiveWindow(bool fallback);
   void OnReceiveTimeout();
   void StartIncomingOfferTimer(qint64 share_target_id);
   void ResolveIncomingOffer(qint64 share_target_id);
   void OnIncomingOfferTimeout(qint64 share_target_id);
-  std::function<void(NearbySharingService::StatusCodes)> StatusCallback(
-      QString operation);
-  void ReportStatus(const QString& operation,
-                    NearbySharingService::StatusCodes status);
+  void ReportStatus(const QString& operation, int status);
   void RefreshIssues();
   QVariantList BuildIssues() const;
 
   ShareTargetModel targets_;
   ShareTransferModel transfers_;
-  nearby::sharing::linux::NoOpAnalyticsRecorder analytics_recorder_;
-  std::unique_ptr<nearby::sharing::linux::LinuxSharingPlatform> platform_;
-  nearby::api::FastInitiationManager* fast_init_manager_ = nullptr;
-  NearbySharingService* service_ = nullptr;
-  TransferCallback send_transfer_callback_;
-  TransferCallback receive_transfer_callback_;
+  QuickShare* qs_ = nullptr;
   QTimer receive_timeout_timer_;
   QTimer issues_timer_;
   QVariantList issues_;

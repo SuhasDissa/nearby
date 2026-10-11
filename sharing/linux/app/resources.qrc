@@ -3,21 +3,16 @@
     <file>main.qml</file>
     <file>qmldir</file>
     <file>AppContent.qml</file>
-    <file>EventBus.qml</file>
-    <file>Sidebar.qml</file>
-    <file>Drop.qml</file>
-    <file>ShareTarget.qml</file>
-    <file>SearchingDevices.qml</file>
-    <file>IncomingShare.qml</file>
+    <file>Theme.qml</file>
+    <file>AppButton.qml</file>
+    <file>AppSwitch.qml</file>
+    <file>RippleAvatar.qml</file>
+    <file>FileList.qml</file>
+    <file>DeviceCard.qml</file>
+    <file>IncomingDialog.qml</file>
     <file>TransferCard.qml</file>
     <file>IssueBanner.qml</file>
-    <file>Targets.qml</file>
     <file>googlesans_var.ttf</file>
-    <file>icons/file.svg</file>
-    <file>icons/up_file.svg</file>
-    <file>icons/tablet.svg</file>
-        <file>icons/laptop.svg</file>
-        <file>icons/quickshare.svg</file>
-        <file>icons/smartphone.svg</file>
+    <file>icons/quickshare.svg</file>
 </qresource>
 </RCC>
